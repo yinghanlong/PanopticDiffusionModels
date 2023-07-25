@@ -1,6 +1,9 @@
 import torch
 import os
 import numpy as np
+import sys
+sys.path.insert(0,'/home/min/a/long273/Documents/diffusers/U-ViT')
+print(sys.path)
 import libs.autoencoder
 import libs.clip
 from datasets import MSCOCODatabase
@@ -18,7 +21,7 @@ def main():
     clip.eval()
     clip.to(device)
 
-    save_dir = f'assets/datasets/coco256_features'
+    save_dir = f'/home/nano01/a/long273/coco256_features'
     latent = clip.encode(prompts)
     print(latent.shape)
     c = latent[0].detach().cpu().numpy()

@@ -71,13 +71,24 @@ class Schedule(object):  # discrete time
         self.cum_alphas = self.skip_alphas[0]  # cum_alphas = alphas.cumprod()
         self.cum_betas = self.skip_betas[0]
         self.snr = self.cum_alphas / self.cum_betas
+        #TODO: number of conditions
+        self.n_cond=2
 
     def tilde_beta(self, s, t):
         return self.skip_betas[s, t] * self.cum_betas[s] / self.cum_betas[t]
 
     def sample(self, x0):  # sample from q(xn|x0), where n is uniform
-        n = np.random.choice(list(range(1, self.N + 1)), (len(x0),))
-        eps = torch.randn_like(x0)
+        n = np.random.choice(list(range(1, self.N + 1)), (len(x0),)) #random step
+        eps = torch.randn_like(x0) #random noise
+        #TODO: set to accumulated masked noise
+        '''
+        masks = torch.zeros_like(x0)
+        for i in range(self.n_cond):
+            #note: setting masks to all ones. Need to modify later
+            mask_i=torch.ones_like(x0)
+            masks+=mask_i 
+        eps = masks * eps
+        '''
         xn = stp(self.cum_alphas[n] ** 0.5, x0) + stp(self.cum_betas[n] ** 0.5, eps)
         return torch.tensor(n, device=x0.device), eps, xn
 
@@ -114,7 +125,7 @@ def train(config):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         wandb.init(dir=os.path.abspath(config.workdir), project=f'uvit_{config.dataset.name}', config=config.to_dict(),
-                   name=config.hparams, job_type='train', mode='offline')
+                   name=config.hparams, job_type='train')#, mode='offline')
         utils.set_logger(log_level='info', fname=os.path.join(config.workdir, 'output.log'))
         logging.info(config)
     else:
@@ -206,7 +217,7 @@ def train(config):
         def sample_fn(_n_samples):
             _context = next(context_generator)
             assert _context.size(0) == _n_samples
-            return dpm_solver_sample(_n_samples, sample_steps, context=_context)
+            return dpm_solver_sample(_n_samples, sample_steps, context=_context) #context: conditions
 
         with tempfile.TemporaryDirectory() as temp_path:
             path = config.sample.path or temp_path
@@ -253,11 +264,20 @@ def train(config):
 
         if train_state.step % config.train.save_interval == 0 or train_state.step == config.train.n_steps:
             torch.cuda.empty_cache()
-            logging.info(f'Save and eval checkpoint {train_state.step}...')
-            if accelerator.local_process_index == 0:
-                train_state.save(os.path.join(config.ckpt_root, f'{train_state.step}.ckpt'))
             accelerator.wait_for_everyone()
             fid = eval_step(n_samples=10000, sample_steps=50)  # calculate fid of the saved checkpoint
+            logging.info(f'Save and eval checkpoint {train_state.step}...')
+            if accelerator.local_process_index == 0:
+                if len(step_fid)==0:
+                    logging.info(f'Save the best checkpoint {train_state.step}...')
+                    train_state.save(os.path.join(config.ckpt_root, f'{train_state.step}.ckpt'))
+                else:
+                    step_best = sorted(step_fid, key=lambda x: x[1])[0][0]
+                    if fid<=step_best: #only save if it is the best
+                        logging.info(f'Save the best checkpoint {train_state.step}...')
+                        train_state.save(os.path.join(config.ckpt_root, f'best.ckpt'))
+            accelerator.wait_for_everyone()
+            
             step_fid.append((train_state.step, fid))
             torch.cuda.empty_cache()
         accelerator.wait_for_everyone()
@@ -266,7 +286,7 @@ def train(config):
     logging.info(f'step_fid: {step_fid}')
     step_best = sorted(step_fid, key=lambda x: x[1])[0][0]
     logging.info(f'step_best: {step_best}')
-    train_state.load(os.path.join(config.ckpt_root, f'{step_best}.ckpt'))
+    train_state.load(os.path.join(config.ckpt_root, f'best.ckpt'))
     del metrics
     accelerator.wait_for_everyone()
     eval_step(n_samples=config.sample.n_samples, sample_steps=config.sample.sample_steps)
@@ -307,7 +327,9 @@ def get_hparams():
             lst.append(f'{hparam}={val}')
     hparams = '-'.join(lst)
     if hparams == '':
-        hparams = 'default'
+        from datetime import datetime
+        date= datetime.now().strftime('%Y-%m-%d-%H-%M')
+        hparams = date
     return hparams
 
 
@@ -315,7 +337,7 @@ def main(argv):
     config = FLAGS.config
     config.config_name = get_config_name()
     config.hparams = get_hparams()
-    config.workdir = FLAGS.workdir or os.path.join('workdir', config.config_name, config.hparams)
+    config.workdir = FLAGS.workdir or os.path.join('/home/nano01/a/long273/results', config.config_name, config.hparams)
     config.ckpt_root = os.path.join(config.workdir, 'ckpts')
     config.sample_dir = os.path.join(config.workdir, 'samples')
     train(config)

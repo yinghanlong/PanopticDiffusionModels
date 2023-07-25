@@ -13,8 +13,8 @@ def get_config():
     config.pred = 'noise_pred'
 
     config.train = d(
-        n_steps=300000,
-        batch_size=1024,
+        n_steps=600000, #300000
+        batch_size=512,#1024 
         mode='cond',
         log_interval=10,
         eval_interval=5000,
@@ -49,16 +49,16 @@ def get_config():
 
     config.dataset = d(
         name='imagenet',
-        path='assets/datasets/ImageNet',
+        path='/local/a/imagenet/imagenet2012/',
         resolution=64,
     )
 
     config.sample = d(
         sample_steps=50,
         n_samples=50000,
-        mini_batch_size=200,
+        mini_batch_size=512,#1024
         algorithm='dpm_solver',
-        path=''
+        path='./results/'
     )
 
     return config

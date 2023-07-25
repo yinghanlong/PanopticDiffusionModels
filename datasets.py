@@ -11,6 +11,9 @@ import glob
 import einops
 import torchvision.transforms.functional as F
 
+from panopticapi.utils import IdGenerator, rgb2id
+import json
+
 
 class UnlabeledDataset(Dataset):
     def __init__(self, dataset):
@@ -439,8 +442,30 @@ class MSCOCODatabase(Dataset):
         self.coco = COCO(annFile)
         self.keys = list(sorted(self.coco.imgs.keys()))
 
+        #TODO: load panoptic segmentation maps
+        if 'train' in self.root:
+            self.segment_folder = self.root+ '/../coco256_features/annotations/panoptic_train2017/'
+            json_file = self.root+ '/../coco256_features/annotations/panoptic_train2017.json'
+        else:
+            self.segment_folder = self.root+ '/../coco256_features/annotations/panoptic_val2017/'
+            json_file = self.root+ '/../coco256_features/annotations/panoptic_val2017.json'
+        with open(json_file, 'r') as f:
+            self.coco_d = json.load(f)
+        self.p_anns = self.coco_d['annotations']
+        #TODO: load panoptic map from annotation
+        #key to annotation pointers
+        self.key_to_ann = {}
+        for p in self.p_anns:
+            if p['image_id'] in self.keys: #find the annotation for image[key]
+                try:
+                    self.key_to_ann[p['image_id']] = p
+                except:
+                    print(f"Undable to find correspoding annotation. {p['image_id']}")
+                break
+
     def _load_image(self, key: int):
         path = self.coco.loadImgs(key)[0]["file_name"]
+        print('file name', path)
         return Image.open(os.path.join(self.root, path)).convert("RGB")
 
     def _load_target(self, key: int):
@@ -462,7 +487,27 @@ class MSCOCODatabase(Dataset):
         for ann in anns:
             target.append(ann['caption'])
 
-        return image, target
+        #TODO: load panoptic map from annotation
+        p_ann= self.key_to_ann[key]
+        
+        #assert ann['image_id'] == key, f" image id should match {index} and {ann['image_id']} " #they would not match because extracted features
+        segmentation = np.array(
+            Image.open(os.path.join(self.segment_folder, p_ann['file_name'])),
+            dtype=np.uint8
+        )
+        segmentation_id = rgb2id(segmentation)
+        #set pixel values to category ids
+        for segment_info in p_ann['segments_info']:
+            color = segment_info['category_id']
+            mask = segmentation_id == segment_info['id']
+            segmentation[mask] = color
+        
+        segmentation = np.array(segmentation).astype(np.uint8)
+        segmentation = center_crop(self.width, self.height, segmentation).astype(np.float32)
+        segmentation = (segmentation/ 100 - 1.0).astype(np.float32) #category id's range is 1-200
+        segmentation = einops.rearrange(segmentation, 'h w c -> c h w')
+        print(segmentation.shape, image.shape)
+        return image, target, segmentation
 
 
 def get_feature_dir_info(root):
@@ -482,6 +527,9 @@ class MSCOCOFeatureDataset(Dataset):
     def __init__(self, root):
         self.root = root
         self.num_data, self.n_captions = get_feature_dir_info(root)
+        #self.anns = list(sorted(self.coco_d['annotations'], key=lambda a: a['image_id']))
+        #self.num_map = len(self.anns)
+        #assert self.num_data==self.num_map, f"dataset size mismatch {self.num_data}, {self.num_map}"
 
     def __len__(self):
         return self.num_data
@@ -490,15 +538,19 @@ class MSCOCOFeatureDataset(Dataset):
         z = np.load(os.path.join(self.root, f'{index}.npy'))
         k = random.randint(0, self.n_captions[index] - 1)
         c = np.load(os.path.join(self.root, f'{index}_{k}.npy'))
-        return z, c
+
+        #TODO: load panoptic segmentation info
+        s = np.load(os.path.join(self.root, f'{index}_p.npy'))
+
+        return z, c, s
 
 
 class MSCOCO256Features(DatasetFactory):  # the moments calculated by Stable Diffusion image encoder & the contexts calculated by clip
     def __init__(self, path, cfg=False, p_uncond=None):
         super().__init__()
         print('Prepare dataset...')
-        self.train = MSCOCOFeatureDataset(os.path.join(path, 'train'))
-        self.test = MSCOCOFeatureDataset(os.path.join(path, 'val'))
+        self.train = MSCOCOFeatureDataset(os.path.join(path, 'train2017'))
+        self.test = MSCOCOFeatureDataset(os.path.join(path, 'val2017'))
         assert len(self.train) == 82783
         assert len(self.test) == 40504
         print('Prepare dataset ok')

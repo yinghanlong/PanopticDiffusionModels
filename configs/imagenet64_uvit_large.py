@@ -49,7 +49,7 @@ def get_config():
 
     config.dataset = d(
         name='imagenet',
-        path='assets/datasets/ImageNet',
+        path='/local/a/imagenet/imagenet2012/',
         resolution=64,
     )
 

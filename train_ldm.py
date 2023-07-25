@@ -43,7 +43,7 @@ def train(config):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         wandb.init(dir=os.path.abspath(config.workdir), project=f'uvit_{config.dataset.name}', config=config.to_dict(),
-                   name=config.hparams, job_type='train', mode='offline')
+                   name=config.hparams, job_type='train')#, mode='offline')
         utils.set_logger(log_level='info', fname=os.path.join(config.workdir, 'output.log'))
         logging.info(config)
     else:
@@ -197,10 +197,17 @@ def train(config):
         if train_state.step % config.train.save_interval == 0 or train_state.step == config.train.n_steps:
             torch.cuda.empty_cache()
             logging.info(f'Save and eval checkpoint {train_state.step}...')
-            if accelerator.local_process_index == 0:
-                train_state.save(os.path.join(config.ckpt_root, f'{train_state.step}.ckpt'))
             accelerator.wait_for_everyone()
             fid = eval_step(n_samples=10000, sample_steps=50, algorithm='dpm_solver')  # calculate fid of the saved checkpoint
+            if accelerator.local_process_index == 0:
+                if len(step_fid)==0:
+                    logging.info(f'Save the best checkpoint {train_state.step}...')
+                    train_state.save(os.path.join(config.ckpt_root, f'{train_state.step}.ckpt'))
+                else:
+                    step_best = sorted(step_fid, key=lambda x: x[1])[0][0]
+                    if fid<=step_best: #only save if it is the best
+                        logging.info(f'Save the best checkpoint {train_state.step}...')
+                        train_state.save(os.path.join(config.ckpt_root, f'best.ckpt'))
             step_fid.append((train_state.step, fid))
             torch.cuda.empty_cache()
         accelerator.wait_for_everyone()
@@ -258,7 +265,7 @@ def main(argv):
     config = FLAGS.config
     config.config_name = get_config_name()
     config.hparams = get_hparams()
-    config.workdir = FLAGS.workdir or os.path.join('workdir', config.config_name, config.hparams)
+    config.workdir = FLAGS.workdir or os.path.join('/home/nano01/a/long273/results', config.config_name, config.hparams)
     config.ckpt_root = os.path.join(config.workdir, 'ckpts')
     config.sample_dir = os.path.join(config.workdir, 'samples')
     train(config)

@@ -32,6 +32,7 @@ def main(resolution=256):
 
     device = "cuda"
     os.makedirs(save_dir)
+    use_category_id = True
 
     autoencoder = libs.autoencoder.get_model('assets/stable-diffusion/autoencoder_kl.pth')
     autoencoder.to(device)
@@ -42,7 +43,7 @@ def main(resolution=256):
     with torch.no_grad():
         for idx, data in tqdm(enumerate(datas)):
             x, captions, segmentation = data
-
+            
             if len(x.shape) == 3:
                 x = x[None, ...]
             x = torch.tensor(x, device=device)
@@ -56,7 +57,15 @@ def main(resolution=256):
                 np.save(os.path.join(save_dir, f'{idx}_{i}.npy'), c)
 
             #TODO: save panoptic annotation
-            print("saved latent/segmentation:",moments.shape, segmentation.shape)
-            np.save(os.path.join(save_dir, f'{idx}_p.npy'), segmentation)
+            print("save annotion,", idx)
+            if use_category_id==True:
+                np.save(os.path.join(save_dir, f'{idx}_p.npy'), segmentation)
+            else:
+                if len(segmentation.shape) == 3:
+                    segmentation = segmentation[None, ...]
+                segmentation = torch.tensor(segmentation, device=device)
+                encode_maps = autoencoder(segmentation, fn='encode_moments').squeeze(0)
+                encode_maps = encode_maps.detach().cpu().numpy()
+                np.save(os.path.join(save_dir, f'{idx}_encode_p.npy'), encode_maps)
 if __name__ == '__main__':
     main()

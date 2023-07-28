@@ -10,6 +10,7 @@ import os
 import glob
 import einops
 import torchvision.transforms.functional as F
+import skimage.measure
 
 from panopticapi.utils import IdGenerator, rgb2id
 import json
@@ -51,10 +52,17 @@ class CFGDataset(Dataset):  # for classifier free guidance
         return len(self.dataset)
 
     def __getitem__(self, item):
-        x, y = self.dataset[item]
+        load_data = self.dataset[item]
+        x = load_data[0]
+        y = load_data[1]
         if random.random() < self.p_uncond:
             y = self.empty_token
-        return x, y
+        
+        if len(load_data)>2:
+            z = load_data[2]
+            return x,y,z
+        else:
+            return x, y
 
 
 class DatasetFactory(object):
@@ -461,11 +469,12 @@ class MSCOCODatabase(Dataset):
                     self.key_to_ann[p['image_id']] = p
                 except:
                     print(f"Undable to find correspoding annotation. {p['image_id']}")
-                break
+        print('length of annotation', len(self.key_to_ann))
+        self.use_category_id = True
 
     def _load_image(self, key: int):
         path = self.coco.loadImgs(key)[0]["file_name"]
-        print('file name', path)
+        #print('file name', path)
         return Image.open(os.path.join(self.root, path)).convert("RGB")
 
     def _load_target(self, key: int):
@@ -497,16 +506,21 @@ class MSCOCODatabase(Dataset):
         )
         segmentation_id = rgb2id(segmentation)
         #set pixel values to category ids
-        for segment_info in p_ann['segments_info']:
-            color = segment_info['category_id']
-            mask = segmentation_id == segment_info['id']
-            segmentation[mask] = color
+        if self.use_category_id==True:
+            for segment_info in p_ann['segments_info']:
+                color = segment_info['category_id']
+                mask = segmentation_id == segment_info['id']                
+                segmentation[mask] = color
         
+        #use raw values of segmentation
         segmentation = np.array(segmentation).astype(np.uint8)
         segmentation = center_crop(self.width, self.height, segmentation).astype(np.float32)
-        segmentation = (segmentation/ 100 - 1.0).astype(np.float32) #category id's range is 1-200
+        if self.use_category_id==True:
+            segmentation = (segmentation/ 100 - 1.0).astype(np.float32) #category id's range is 1-200
+        else:
+            segmentation = (segmentation/ 127.5 - 1.0).astype(np.float32) 
         segmentation = einops.rearrange(segmentation, 'h w c -> c h w')
-        print(segmentation.shape, image.shape)
+        #print(segmentation.shape, image.shape) #same, (3,256,256)
         return image, target, segmentation
 
 
@@ -518,7 +532,8 @@ def get_feature_dir_info(root):
     for f in files_caption:
         name = os.path.split(f)[-1]
         k1, k2 = os.path.splitext(name)[0].split('_')
-        n_captions[int(k1)] += 1
+        if k2.isnumeric()==True:
+            n_captions[int(k1)] += 1
     return num_data, n_captions
 
 
@@ -527,6 +542,7 @@ class MSCOCOFeatureDataset(Dataset):
     def __init__(self, root):
         self.root = root
         self.num_data, self.n_captions = get_feature_dir_info(root)
+        self.use_category_id = True
         #self.anns = list(sorted(self.coco_d['annotations'], key=lambda a: a['image_id']))
         #self.num_map = len(self.anns)
         #assert self.num_data==self.num_map, f"dataset size mismatch {self.num_data}, {self.num_map}"
@@ -540,8 +556,14 @@ class MSCOCOFeatureDataset(Dataset):
         c = np.load(os.path.join(self.root, f'{index}_{k}.npy'))
 
         #TODO: load panoptic segmentation info
-        s = np.load(os.path.join(self.root, f'{index}_p.npy'))
+        if self.use_category_id == True:
+            s = np.load(os.path.join(self.root, f'{index}_p.npy'))
+            #pool from size (3,256,256) to (1,32,32)
+            s = skimage.measure.block_reduce(s, (3,8,8), np.min)
+        else: #use encoded panoptic map
+            s = np.load(os.path.join(self.root, f'{index}_encode_p.npy'))
 
+        assert s.shape[-1]==z.shape[-1], f'{s.shape}, {z.shape}'
         return z, c, s
 
 
@@ -551,9 +573,10 @@ class MSCOCO256Features(DatasetFactory):  # the moments calculated by Stable Dif
         print('Prepare dataset...')
         self.train = MSCOCOFeatureDataset(os.path.join(path, 'train2017'))
         self.test = MSCOCOFeatureDataset(os.path.join(path, 'val2017'))
-        assert len(self.train) == 82783
-        assert len(self.test) == 40504
-        print('Prepare dataset ok')
+        
+        #assert len(self.train) == 82783
+        #assert len(self.test) == 40504
+        print('Prepare dataset ok',len(self.train), len(self.test))
 
         self.empty_context = np.load(os.path.join(path, 'empty_context.npy'))
 

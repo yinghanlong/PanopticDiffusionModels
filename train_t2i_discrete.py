@@ -71,24 +71,21 @@ class Schedule(object):  # discrete time
         self.cum_alphas = self.skip_alphas[0]  # cum_alphas = alphas.cumprod()
         self.cum_betas = self.skip_betas[0]
         self.snr = self.cum_alphas / self.cum_betas
-        #TODO: number of conditions
-        self.n_cond=2
+        #TODO: use panoptic info
+        self.use_panoptic = False
+        self.use_category_id= False
 
     def tilde_beta(self, s, t):
         return self.skip_betas[s, t] * self.cum_betas[s] / self.cum_betas[t]
 
-    def sample(self, x0):  # sample from q(xn|x0), where n is uniform
+    def sample(self, x0, panoptic):  # sample from q(xn|x0), where n is uniform
         n = np.random.choice(list(range(1, self.N + 1)), (len(x0),)) #random step
         eps = torch.randn_like(x0) #random noise
         #TODO: set to accumulated masked noise
-        '''
-        masks = torch.zeros_like(x0)
-        for i in range(self.n_cond):
-            #note: setting masks to all ones. Need to modify later
-            mask_i=torch.ones_like(x0)
-            masks+=mask_i 
-        eps = masks * eps
-        '''
+        if self.use_category_id==True and self.use_panoptic==True:       
+            eps = panoptic * eps
+        elif self.use_panoptic==True:
+            eps = panoptic * eps
         xn = stp(self.cum_alphas[n] ** 0.5, x0) + stp(self.cum_betas[n] ** 0.5, eps)
         return torch.tensor(n, device=x0.device), eps, xn
 
@@ -96,8 +93,8 @@ class Schedule(object):  # discrete time
         return f'Schedule({self.betas[:10]}..., {self.N})'
 
 
-def LSimple(x0, nnet, schedule, **kwargs):
-    n, eps, xn = schedule.sample(x0)  # n in {1, ..., 1000}
+def LSimple(x0, nnet, schedule, panoptic, **kwargs):
+    n, eps, xn = schedule.sample(x0, panoptic)  # n in {1, ..., 1000}
     eps_pred = nnet(xn, n, **kwargs)
     return mos(eps - eps_pred)
 
@@ -169,7 +166,7 @@ def train(config):
     def get_context_generator():
         while True:
             for data in test_dataset_loader:
-                _, _context = data
+                _context = data[1]
                 yield _context
 
     context_generator = get_context_generator()
@@ -189,7 +186,7 @@ def train(config):
         _metrics = dict()
         optimizer.zero_grad()
         _z = autoencoder.sample(_batch[0]) if 'feature' in config.dataset.name else encode(_batch[0])
-        loss = LSimple(_z, nnet, _schedule, context=_batch[1])  # currently only support the extracted feature version
+        loss = LSimple(_z, nnet, _schedule, context=_batch[1], panoptic=_batch[2])  # currently only support the extracted feature version
         _metrics['loss'] = accelerator.gather(loss.detach()).mean()
         accelerator.backward(loss.mean())
         optimizer.step()
@@ -328,8 +325,8 @@ def get_hparams():
     hparams = '-'.join(lst)
     if hparams == '':
         from datetime import datetime
-        date= datetime.now().strftime('%Y-%m-%d-%H-%M')
-        hparams = date
+        #date= datetime.now().strftime('%Y-%m-%d-%H-%M')
+        hparams = 'coco2017'#'panoptic-category'
     return hparams
 
 

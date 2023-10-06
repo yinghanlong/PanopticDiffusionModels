@@ -49,7 +49,8 @@ def stp(s, ts: torch.Tensor):  # scalar tensor product
 def mos(a, start_dim=1):  # mean of square
     return a.pow(2).flatten(start_dim=start_dim).mean(dim=-1)
 
-
+#TODO: global flag to use panoptic info
+use_panoptic = True
 class Schedule(object):  # discrete time
     def __init__(self, _betas):
         r""" _betas[0...999] = betas[1...1000]
@@ -72,7 +73,6 @@ class Schedule(object):  # discrete time
         self.cum_betas = self.skip_betas[0]
         self.snr = self.cum_alphas / self.cum_betas
         #TODO: use panoptic info
-        self.use_panoptic = False
         self.use_category_id= False
 
     def tilde_beta(self, s, t):
@@ -82,11 +82,12 @@ class Schedule(object):  # discrete time
         n = np.random.choice(list(range(1, self.N + 1)), (len(x0),)) #random step
         eps = torch.randn_like(x0) #random noise
         #TODO: set to accumulated masked noise
-        if self.use_category_id==True and self.use_panoptic==True:       
-            eps = panoptic * eps
-        elif self.use_panoptic==True:
-            eps = panoptic * eps
+        if self.use_category_id==True and use_panoptic==True:       
+            eps = panoptic #* eps
+        elif use_panoptic==True:
+            eps = panoptic #* eps
         xn = stp(self.cum_alphas[n] ** 0.5, x0) + stp(self.cum_betas[n] ** 0.5, eps)
+        #TODO: still predict eps even though p*eps is added to xn
         return torch.tensor(n, device=x0.device), eps, xn
 
     def __repr__(self):
@@ -166,7 +167,7 @@ def train(config):
     def get_context_generator():
         while True:
             for data in test_dataset_loader:
-                _context = data[1]
+                _context = data[1:]
                 yield _context
 
     context_generator = get_context_generator()
@@ -195,16 +196,31 @@ def train(config):
         train_state.step += 1
         return dict(lr=train_state.optimizer.param_groups[0]['lr'], **_metrics)
 
-    def dpm_solver_sample(_n_samples, _sample_steps, **kwargs):
+    def dpm_solver_sample(_n_samples, _sample_steps, panoptic=None, **kwargs): #context is another input
+        #TODO: modify sampling to add panoptic mask
+        #add a input panoptic 
         _z_init = torch.randn(_n_samples, *config.z_shape, device=device)
+        #if panoptic is not None:
+        #    _z_init = _z_init* panoptic
+        
         noise_schedule = NoiseScheduleVP(schedule='discrete', betas=torch.tensor(_betas, device=device).float())
 
-        def model_fn(x, t_continuous):
+        def model_fn(x, t_continuous, panoptic=None):
             t = t_continuous * _schedule.N
-            return cfg_nnet(x, t, **kwargs)
+            if panoptic is None:
+                return cfg_nnet(x, t, **kwargs)
+            else:
+                return cfg_nnet(x, t, **kwargs)
+                #TODO: try division in the backward process
+                #return torch.div( cfg_nnet(x, t, **kwargs), panoptic+1.0e-6)
 
         dpm_solver = DPM_Solver(model_fn, noise_schedule, predict_x0=True, thresholding=False)
-        _z = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1.)
+        solver_order=1
+        #TODO: try first order solver, set order=1
+        if solver_order==1:
+            _z = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=1, panoptic=panoptic, method='singlestep')
+        else:
+            _z = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=3, panoptic=panoptic)
         return decode(_z)
 
     def eval_step(n_samples, sample_steps):
@@ -213,14 +229,17 @@ def train(config):
 
         def sample_fn(_n_samples):
             _context = next(context_generator)
-            assert _context.size(0) == _n_samples
-            return dpm_solver_sample(_n_samples, sample_steps, context=_context) #context: conditions
-
+            assert _context[0].size(0) == _n_samples
+            if use_panoptic==True:
+                return dpm_solver_sample(_n_samples, sample_steps, panoptic=_context[1],context=_context[0]) #context: conditions
+            else:
+                return dpm_solver_sample(_n_samples, sample_steps, panoptic=None,context=_context[0]) #context: conditions
+            
         with tempfile.TemporaryDirectory() as temp_path:
             path = config.sample.path or temp_path
             if accelerator.is_main_process:
                 os.makedirs(path, exist_ok=True)
-            utils.sample2dir(accelerator, path, n_samples, config.sample.mini_batch_size, sample_fn, dataset.unpreprocess)
+            utils.sample2dir(accelerator, path, n_samples, config.sample.mini_batch_size, sample_fn, dataset.unpreprocess, step=train_state.step)
 
             _fid = 0
             if accelerator.is_main_process:
@@ -238,6 +257,8 @@ def train(config):
 
     step_fid = []
     while train_state.step < config.train.n_steps:
+        #TODO: set evaluation only
+        #if config.evaluation_only is None:
         nnet.train()
         batch = tree_map(lambda x: x.to(device), next(data_generator))
         metrics = train_step(batch)
@@ -248,18 +269,23 @@ def train(config):
             logging.info(config.workdir)
             wandb.log(metrics, step=train_state.step)
 
-        if accelerator.is_main_process and train_state.step % config.train.eval_interval == 0:
+        if accelerator.is_main_process and (train_state.step % config.train.eval_interval == 0 or config.evaluation_only):
             torch.cuda.empty_cache()
             logging.info('Save a grid of images...')
             contexts = torch.tensor(dataset.contexts, device=device)[: 2 * 5]
-            samples = dpm_solver_sample(_n_samples=2 * 5, _sample_steps=50, context=contexts)
+            #TODO: generate images from random sample from coco dataset
+            #contexts = next(context_generator)
+            #TODO: find nearest neighbor panoptic masks for samples
+            #logging.info('Sample a grid of images...')
+            samples = dpm_solver_sample(_n_samples=2*5, _sample_steps=50, panoptic=None, context=contexts)
+            accelerator.wait_for_everyone()
             samples = make_grid(dataset.unpreprocess(samples), 5)
             save_image(samples, os.path.join(config.sample_dir, f'{train_state.step}.png'))
             wandb.log({'samples': wandb.Image(samples)}, step=train_state.step)
             torch.cuda.empty_cache()
         accelerator.wait_for_everyone()
 
-        if train_state.step % config.train.save_interval == 0 or train_state.step == config.train.n_steps:
+        if config.evaluation_only or train_state.step % config.train.save_interval == 0 or train_state.step == config.train.n_steps:
             torch.cuda.empty_cache()
             accelerator.wait_for_everyone()
             fid = eval_step(n_samples=10000, sample_steps=50)  # calculate fid of the saved checkpoint
@@ -272,7 +298,7 @@ def train(config):
                     step_best = sorted(step_fid, key=lambda x: x[1])[0][0]
                     if fid<=step_best: #only save if it is the best
                         logging.info(f'Save the best checkpoint {train_state.step}...')
-                        train_state.save(os.path.join(config.ckpt_root, f'best.ckpt'))
+                        train_state.save(os.path.join(config.ckpt_root, f'{train_state.step}.ckpt'))
             accelerator.wait_for_everyone()
             
             step_fid.append((train_state.step, fid))
@@ -283,7 +309,7 @@ def train(config):
     logging.info(f'step_fid: {step_fid}')
     step_best = sorted(step_fid, key=lambda x: x[1])[0][0]
     logging.info(f'step_best: {step_best}')
-    train_state.load(os.path.join(config.ckpt_root, f'best.ckpt'))
+    train_state.load(os.path.join(config.ckpt_root, f'{step_best}.ckpt'))
     del metrics
     accelerator.wait_for_everyone()
     eval_step(n_samples=config.sample.n_samples, sample_steps=config.sample.sample_steps)
@@ -302,6 +328,7 @@ config_flags.DEFINE_config_file(
     "config", None, "Training configuration.", lock_config=False)
 flags.mark_flags_as_required(["config"])
 flags.DEFINE_string("workdir", None, "Work unit directory.")
+flags.DEFINE_bool("evaluation_only", False, "skip training")
 
 
 def get_config_name():
@@ -315,7 +342,7 @@ def get_hparams():
     argv = sys.argv
     lst = []
     for i in range(1, len(argv)):
-        assert '=' in argv[i]
+        #assert '=' in argv[i]
         if argv[i].startswith('--config.') and not argv[i].startswith('--config.dataset.path'):
             hparam, val = argv[i].split('=')
             hparam = hparam.split('.')[-1]
@@ -325,8 +352,8 @@ def get_hparams():
     hparams = '-'.join(lst)
     if hparams == '':
         from datetime import datetime
-        #date= datetime.now().strftime('%Y-%m-%d-%H-%M')
-        hparams = 'coco2017'#'panoptic-category'
+        date= datetime.now().strftime('%Y-%m-%d-%H-%M')
+        hparams = 'coco2017-1-predict-panoptic'#+date
     return hparams
 
 
@@ -337,6 +364,9 @@ def main(argv):
     config.workdir = FLAGS.workdir or os.path.join('/home/nano01/a/long273/results', config.config_name, config.hparams)
     config.ckpt_root = os.path.join(config.workdir, 'ckpts')
     config.sample_dir = os.path.join(config.workdir, 'samples')
+    config.evaluation_only = FLAGS.evaluation_only
+    if config.evaluation_only:
+        print("!!!!evaluation only!!!!!")
     train(config)
 
 

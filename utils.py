@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 import os
 from tqdm import tqdm
-from torchvision.utils import save_image
+from torchvision.utils import save_image, make_grid
 from absl import logging
 
 
@@ -112,8 +112,14 @@ class TrainState(object):
             ckpts = list(filter(lambda x: '.ckpt' in x, os.listdir(ckpt_root)))
             if not ckpts:
                 return
-            steps = map(lambda x: int(x.split(".")[0]), ckpts)
-            step = max(steps)
+            if not isinstance(ckpts[0].split(".")[0],int):
+                ckpt_path = os.path.join(ckpt_root, f'best.ckpt')
+                logging.info(f'resume from {ckpt_path}')
+                self.load(ckpt_path)
+                return
+            else:
+                steps = map(lambda x: int(x.split(".")[0]), ckpts)
+                step = max(steps)
         ckpt_path = os.path.join(ckpt_root, f'{step}.ckpt')
         logging.info(f'resume from {ckpt_path}')
         self.load(ckpt_path)
@@ -153,7 +159,7 @@ def amortize(n_samples, batch_size):
     return k * [batch_size] if r == 0 else k * [batch_size] + [r]
 
 
-def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unpreprocess_fn=None):
+def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unpreprocess_fn=None, step=None):
     os.makedirs(path, exist_ok=True)
     idx = 0
     batch_size = mini_batch_size * accelerator.num_processes
@@ -162,6 +168,9 @@ def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unprepr
         samples = unpreprocess_fn(sample_fn(mini_batch_size))
         samples = accelerator.gather(samples.contiguous())[:_batch_size]
         if accelerator.is_main_process:
+            if idx==0 and (step is not None): #visualize in wandb
+                grid_samples = make_grid(dataset.unpreprocess(samples), 8)
+                wandb.log({'eval_samples': wandb.Image(grid_samples)}, step)
             for sample in samples:
                 save_image(sample, os.path.join(path, f"{idx}.png"))
                 idx += 1

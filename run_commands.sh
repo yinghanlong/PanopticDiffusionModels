@@ -27,7 +27,8 @@ accelerate launch --multi_gpu --num_processes 8 --mixed_precision fp16 train_ldm
 accelerate launch --multi_gpu --num_processes 8 --mixed_precision fp16 train_ldm_discrete.py --config=configs/imagenet512_uvit_huge.py
 
 # MS-COCO (U-ViT-S/2)
-accelerate launch --multi_gpu --num_processes 1 --mixed_precision fp16 train_t2i_discrete.py --config=configs/mscoco_uvit_small.py
+accelerate launch --multi_gpu --num_processes 2 --mixed_precision fp16 train_t2i_discrete.py --config=configs/mscoco_uvit_small.py
+accelerate launch  --num_processes 1 --mixed_precision fp16 train_t2i_discrete.py --config=configs/mscoco_uvit_small.py
 
 # MS-COCO (U-ViT-S/2, Deep)
 accelerate launch --multi_gpu --num_processes 4 --mixed_precision fp16 train_t2i_discrete.py --config=configs/mscoco_uvit_small.py --config.nnet.depth=16

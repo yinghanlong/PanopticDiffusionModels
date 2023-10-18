@@ -83,9 +83,9 @@ class Schedule(object):  # discrete time
         eps = torch.randn_like(x0) #random noise
         #TODO: set to accumulated masked noise
         if self.use_category_id==True and use_panoptic==True:       
-            eps = panoptic #* eps
+            eps = eps #panoptic * eps
         elif use_panoptic==True:
-            eps = panoptic #* eps
+            eps = eps #panoptic * eps
         xn = stp(self.cum_alphas[n] ** 0.5, x0) + stp(self.cum_betas[n] ** 0.5, eps)
         #TODO: still predict eps even though p*eps is added to xn
         return torch.tensor(n, device=x0.device), eps, xn
@@ -96,8 +96,12 @@ class Schedule(object):  # discrete time
 
 def LSimple(x0, nnet, schedule, panoptic, **kwargs):
     n, eps, xn = schedule.sample(x0, panoptic)  # n in {1, ..., 1000}
-    eps_pred = nnet(xn, n, **kwargs)
-    return mos(eps - eps_pred)
+
+    eps_pred, mask_pred = nnet(xn, n, **kwargs)
+    #TODO: sum the losses
+    loss_eps = mos(eps - eps_pred)
+    loss_mask =  mos(panoptic- mask_pred)
+    return loss_eps, loss_mask, mask_pred
 
 
 def train(config):
@@ -176,20 +180,25 @@ def train(config):
     _schedule = Schedule(_betas)
     logging.info(f'use {_schedule}')
 
-    def cfg_nnet(x, timesteps, context):
-        _cond = nnet_ema(x, timesteps, context=context)
+    def cfg_nnet(x, timesteps, context, mask_token=None):
+        _cond, pred_mask = nnet_ema(x, timesteps, context=context, mask_token=mask_token)
         _empty_context = torch.tensor(dataset.empty_context, device=device)
         _empty_context = einops.repeat(_empty_context, 'L D -> B L D', B=x.size(0))
         _uncond = nnet_ema(x, timesteps, context=_empty_context)
-        return _cond + config.sample.scale * (_cond - _uncond)
+        return _cond + config.sample.scale * (_cond - _uncond), pred_mask
 
     def train_step(_batch):
         _metrics = dict()
         optimizer.zero_grad()
         _z = autoencoder.sample(_batch[0]) if 'feature' in config.dataset.name else encode(_batch[0])
-        loss = LSimple(_z, nnet, _schedule, context=_batch[1], panoptic=_batch[2])  # currently only support the extracted feature version
-        _metrics['loss'] = accelerator.gather(loss.detach()).mean()
-        accelerator.backward(loss.mean())
+
+        mask_token = torch.randn_like(_z,device=_z.device)
+        loss_eps, loss_mask, mask_pred = LSimple(_z, nnet, _schedule, panoptic=_batch[2], context=_batch[1], mask_token=mask_token)  # currently only support the extracted feature version
+        _metrics['loss'] = accelerator.gather(loss_eps.detach()).mean()
+        _metrics['loss_mask'] = accelerator.gather(loss_mask.detach()).mean()
+        #TODO: backpropagate the sum of losses
+        loss_sum = loss_eps + loss_mask
+        accelerator.backward(loss_sum.mean())
         optimizer.step()
         lr_scheduler.step()
         train_state.ema_update(config.get('ema_rate', 0.9999))
@@ -200,28 +209,40 @@ def train(config):
         #TODO: modify sampling to add panoptic mask
         #add a input panoptic 
         _z_init = torch.randn(_n_samples, *config.z_shape, device=device)
+        mask_token = torch.randn(_n_samples, *config.z_shape, device=device)
         #if panoptic is not None:
         #    _z_init = _z_init* panoptic
         
         noise_schedule = NoiseScheduleVP(schedule='discrete', betas=torch.tensor(_betas, device=device).float())
 
-        def model_fn(x, t_continuous, panoptic=None):
+        def model_fn(x, t_continuous, panoptic=None, mask_token=None):
             t = t_continuous * _schedule.N
             if panoptic is None:
-                return cfg_nnet(x, t, **kwargs)
+                return cfg_nnet(x, t, mask_token=mask_token, **kwargs)
             else:
-                return cfg_nnet(x, t, **kwargs)
+                return cfg_nnet(x, t, mask_token=mask_token, **kwargs)
                 #TODO: try division in the backward process
+                #return panoptic * cfg_nnet(x, t, **kwargs)
                 #return torch.div( cfg_nnet(x, t, **kwargs), panoptic+1.0e-6)
 
         dpm_solver = DPM_Solver(model_fn, noise_schedule, predict_x0=True, thresholding=False)
         solver_order=1
         #TODO: try first order solver, set order=1
         if solver_order==1:
-            _z = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=1, panoptic=panoptic, method='singlestep')
+            _z, pred_mask = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=1, panoptic=panoptic, method='singlestep', mask_token=mask_token)
         else:
-            _z = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=3, panoptic=panoptic)
-        return decode(_z)
+            _z = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=3, panoptic=panoptic, mask_token=mask_token)
+        #TODO: show predicted mask, evaluate the loss with panoptic
+        if panoptic is not None:
+            loss_mask =  mos(panoptic- pred_mask)
+            loss_mean = accelerator.gather(loss_mask.detach()).mean()
+            #pred_mask = make_grid(pred_mask, 8)
+            #save_image(samples, os.path.join(config.sample_dir, f'{train_state.step}.png'))
+            #wandb.log({'pred_mask': wandb.Image(pred_mask)}, step=train_state.step)
+
+            return decode(_z), pred_mask, loss_mean
+        else:
+            return decode(_z)
 
     def eval_step(n_samples, sample_steps):
         logging.info(f'eval_step: n_samples={n_samples}, sample_steps={sample_steps}, algorithm=dpm_solver, '
@@ -239,7 +260,7 @@ def train(config):
             path = config.sample.path or temp_path
             if accelerator.is_main_process:
                 os.makedirs(path, exist_ok=True)
-            utils.sample2dir(accelerator, path, n_samples, config.sample.mini_batch_size, sample_fn, dataset.unpreprocess, step=train_state.step)
+            utils.sample2dir(accelerator, path, n_samples, config.sample.mini_batch_size, sample_fn, dataset.unpreprocess, step=train_state.step, use_panoptic=True)
 
             _fid = 0
             if accelerator.is_main_process:
@@ -248,6 +269,7 @@ def train(config):
                 with open(os.path.join(config.workdir, 'eval.log'), 'a') as f:
                     print(f'step={train_state.step} fid{n_samples}={_fid}', file=f)
                 wandb.log({f'fid{n_samples}': _fid}, step=train_state.step)
+                
             _fid = torch.tensor(_fid, device=device)
             _fid = accelerator.reduce(_fid, reduction='sum')
 
@@ -277,11 +299,17 @@ def train(config):
             #contexts = next(context_generator)
             #TODO: find nearest neighbor panoptic masks for samples
             #logging.info('Sample a grid of images...')
-            samples = dpm_solver_sample(_n_samples=2*5, _sample_steps=50, panoptic=None, context=contexts)
+            if use_panoptic==True:
+                samples, pred_mask, _ = dpm_solver_sample(_n_samples=2*5, _sample_steps=50, panoptic=1.0, context=contexts)
+                grid_mask = make_grid(dataset.unpreprocess(pred_mask), 5)
+                wandb.log({'samples pred_mask': wandb.Image(grid_mask)}, step=train_state.step)
+            else:
+                samples= dpm_solver_sample(_n_samples=2*5, _sample_steps=50, panoptic=None, context=contexts)
             accelerator.wait_for_everyone()
             samples = make_grid(dataset.unpreprocess(samples), 5)
             save_image(samples, os.path.join(config.sample_dir, f'{train_state.step}.png'))
             wandb.log({'samples': wandb.Image(samples)}, step=train_state.step)
+            
             torch.cuda.empty_cache()
         accelerator.wait_for_everyone()
 
@@ -353,7 +381,7 @@ def get_hparams():
     if hparams == '':
         from datetime import datetime
         date= datetime.now().strftime('%Y-%m-%d-%H-%M')
-        hparams = 'coco2017-1-predict-panoptic'#+date
+        hparams = 'coco2017-1-predict-mask'#+date
     return hparams
 
 

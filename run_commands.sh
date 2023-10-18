@@ -1,3 +1,4 @@
+ssh long273@cbric-gpu15.ecn.purdue.edu
 cd Documents
 source myenv/bin/activate
 cd diffusers/U-ViT

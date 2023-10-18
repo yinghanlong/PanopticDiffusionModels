@@ -5,6 +5,7 @@ import os
 from tqdm import tqdm
 from torchvision.utils import save_image, make_grid
 from absl import logging
+import wandb
 
 
 def set_logger(log_level='info', fname=None):
@@ -112,7 +113,7 @@ class TrainState(object):
             ckpts = list(filter(lambda x: '.ckpt' in x, os.listdir(ckpt_root)))
             if not ckpts:
                 return
-            if not isinstance(ckpts[0].split(".")[0],int):
+            if not ckpts[0].split(".")[0].isnumeric():
                 ckpt_path = os.path.join(ckpt_root, f'best.ckpt')
                 logging.info(f'resume from {ckpt_path}')
                 self.load(ckpt_path)
@@ -159,21 +160,31 @@ def amortize(n_samples, batch_size):
     return k * [batch_size] if r == 0 else k * [batch_size] + [r]
 
 
-def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unpreprocess_fn=None, step=None):
+def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unpreprocess_fn=None, step=None, use_panoptic=False):
     os.makedirs(path, exist_ok=True)
     idx = 0
     batch_size = mini_batch_size * accelerator.num_processes
-
+    loss_mask_all= []
     for _batch_size in tqdm(amortize(n_samples, batch_size), disable=not accelerator.is_main_process, desc='sample2dir'):
-        samples = unpreprocess_fn(sample_fn(mini_batch_size))
+        if use_panoptic==False:
+            samples = sample_fn(mini_batch_size)
+        else:
+            samples, pred_mask, loss_mask = sample_fn(mini_batch_size)
+            #TODO:accumulate loss
+            loss_mask_all.append(loss_mask)
+        samples = unpreprocess_fn(samples)
         samples = accelerator.gather(samples.contiguous())[:_batch_size]
         if accelerator.is_main_process:
-            if idx==0 and (step is not None): #visualize in wandb
-                grid_samples = make_grid(dataset.unpreprocess(samples), 8)
+            if idx==0 and (step is not None) and use_panoptic==True: #visualize in wandb
+                grid_samples = make_grid(samples, 8)
                 wandb.log({'eval_samples': wandb.Image(grid_samples)}, step)
+                grid_mask = make_grid(unpreprocess_fn(pred_mask), 8)
+                wandb.log({'pred_mask': wandb.Image(grid_mask)}, step)
             for sample in samples:
                 save_image(sample, os.path.join(path, f"{idx}.png"))
                 idx += 1
+    if use_panoptic==True and step is not None:
+        wandb.log({f'eval_loss_mask': torch.mean(torch.stack(loss_mask_all))}, step)
 
 
 def grad_norm(model):

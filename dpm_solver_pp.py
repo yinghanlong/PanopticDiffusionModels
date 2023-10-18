@@ -306,11 +306,11 @@ class DPM_Solver:
         self.thresholding = thresholding
         self.max_val = max_val
 
-    def model_fn(self, x, t, panoptic=None):
+    def model_fn(self, x, t, panoptic=None, mask_token=None):
         #TODO: edit this to give panoptic segment info
         if self.predict_x0:
             alpha_t, sigma_t = self.noise_schedule.marginal_alpha(t), self.noise_schedule.marginal_std(t)
-            noise = self.model(x, t, panoptic=panoptic)
+            noise, pred_mask = self.model(x, t, panoptic=panoptic, mask_token=mask_token)
             dims = len(x.shape) - 1
             x0 = (x - sigma_t[(...,) + (None,)*dims] * noise) / alpha_t[(...,) + (None,)*dims]
             if self.thresholding:
@@ -318,9 +318,9 @@ class DPM_Solver:
                 s = torch.quantile(torch.abs(x0).reshape((x0.shape[0], -1)), p, dim=1)
                 s = torch.maximum(s, torch.ones_like(s).to(s.device))[(...,) + (None,)*dims]
                 x0 = torch.clamp(x0, -s, s) / (s / self.max_val)
-            return x0
+            return x0, pred_mask
         else:
-            return self.model(x, t, panoptic=panoptic)
+            return self.model(x, t, panoptic=panoptic, mask_token=mask_token)
 
     def get_time_steps(self, skip_type, t_T, t_0, N, device):
         """Compute the intermediate time steps for sampling.
@@ -412,7 +412,7 @@ class DPM_Solver:
         )
         return x_0
 
-    def dpm_solver_first_update(self, x, s, t, noise_s=None, return_noise=False, panoptic=None):
+    def dpm_solver_first_update(self, x, s, t, noise_s=None, return_noise=False, panoptic=None, mask_token=None):
         """
         A single step for DPM-Solver-1.
 
@@ -435,7 +435,7 @@ class DPM_Solver:
         if self.predict_x0:
             phi_1 = (torch.exp(-h) - 1.) / (-1.)
             if noise_s is None:
-                noise_s = self.model_fn(x, s, panoptic=panoptic)
+                noise_s, pred_mask = self.model_fn(x, s, panoptic=panoptic, mask_token=mask_token)
             x_t = (
                 (sigma_t / sigma_s)[(...,) + (None,)*dims] * x
                 + (alpha_t * phi_1)[(...,) + (None,)*dims] * noise_s
@@ -443,11 +443,11 @@ class DPM_Solver:
             if return_noise:
                 return x_t, {'noise_s': noise_s}
             else:
-                return x_t
+                return x_t, pred_mask
         else:
             phi_1 = torch.expm1(h)
             if noise_s is None:
-                noise_s = self.model_fn(x, s, panoptic=panoptic)
+                noise_s, pred_mask = self.model_fn(x, s, panoptic=panoptic, mask_token=mask_token)
             x_t = (
                 torch.exp(log_alpha_t - log_alpha_s)[(...,) + (None,)*dims] * x
                 - (sigma_t * phi_1)[(...,) + (None,)*dims] * noise_s
@@ -455,9 +455,9 @@ class DPM_Solver:
             if return_noise:
                 return x_t, {'noise_s': noise_s}
             else:
-                return x_t
+                return x_t, pred_mask
 
-    def dpm_solver_second_update(self, x, s, t, r1=0.5, noise_s=None, return_noise=False, solver_type='dpm_solver', panoptic=None):
+    def dpm_solver_second_update(self, x, s, t, r1=0.5, noise_s=None, return_noise=False, solver_type='dpm_solver', panoptic=None, mask_token=None):
         """
         A single step for DPM-Solver-2.
 
@@ -489,12 +489,12 @@ class DPM_Solver:
             phi_1 = torch.expm1(-h)
 
             if noise_s is None:
-                noise_s = self.model_fn(x, s, panoptic=panoptic)
+                noise_s = self.model_fn(x, s, panoptic=panoptic, mask_token=mask_token)
             x_s1 = (
                 (sigma_s1 / sigma_s)[(...,) + (None,)*dims] * x
                 - (alpha_s1 * phi_11)[(...,) + (None,)*dims] * noise_s
             )
-            noise_s1 = self.model_fn(x_s1, s1, panoptic=panoptic)
+            noise_s1 = self.model_fn(x_s1, s1, panoptic=panoptic, mask_token=mask_token)
             if solver_type == 'dpm_solver':
                 x_t = (
                     (sigma_t / sigma_s)[(...,) + (None,)*dims] * x
@@ -514,12 +514,12 @@ class DPM_Solver:
             phi_1 = torch.expm1(h)
 
             if noise_s is None:
-                noise_s = self.model_fn(x, s, panoptic=panoptic)
+                noise_s = self.model_fn(x, s, panoptic=panoptic, mask_token=mask_token)
             x_s1 = (
                 torch.exp(log_alpha_s1 - log_alpha_s)[(...,) + (None,)*dims] * x
                 - (sigma_s1 * phi_11)[(...,) + (None,)*dims] * noise_s
             )
-            noise_s1 = self.model_fn(x_s1, s1, panoptic=panoptic)
+            noise_s1 = self.model_fn(x_s1, s1, panoptic=panoptic, mask_token=mask_token)
             if solver_type == 'dpm_solver':
                 x_t = (
                     torch.exp(log_alpha_t - log_alpha_s)[(...,) + (None,)*dims] * x
@@ -617,7 +617,7 @@ class DPM_Solver:
             )
         return x_t
 
-    def dpm_solver_third_update(self, x, s, t, r1=1./3., r2=2./3., noise_s=None, noise_s1=None, noise_s2=None, return_noise=False, solver_type='dpm_solver', panoptic=None):
+    def dpm_solver_third_update(self, x, s, t, r1=1./3., r2=2./3., noise_s=None, noise_s1=None, noise_s2=None, return_noise=False, solver_type='dpm_solver', panoptic=None, mask_token=None):
         """
         A single step for DPM-Solver-3.
 
@@ -659,20 +659,20 @@ class DPM_Solver:
             phi_3 = phi_2 / h - 0.5
 
             if noise_s is None:
-                noise_s = self.model_fn(x, s, panoptic=panoptic)
+                noise_s = self.model_fn(x, s, panoptic=panoptic, mask_token=mask_token)
             if noise_s1 is None:
                 x_s1 = (
                     (sigma_s1 / sigma_s)[(...,) + (None,)*dims] * x
                     - (alpha_s1 * phi_11)[(...,) + (None,)*dims] * noise_s
                 )
-                noise_s1 = self.model_fn(x_s1, s1, panoptic=panoptic)
+                noise_s1 = self.model_fn(x_s1, s1, panoptic=panoptic, mask_token=mask_token)
             if noise_s2 is None:
                 x_s2 = (
                     (sigma_s2 / sigma_s)[(...,) + (None,)*dims] * x
                     - (alpha_s2 * phi_12)[(...,) + (None,)*dims] * noise_s
                     + r2 / r1 * (alpha_s2 * phi_22)[(...,) + (None,)*dims] * (noise_s1 - noise_s)
                 )
-                noise_s2 = self.model_fn(x_s2, s2, panoptic=panoptic)
+                noise_s2 = self.model_fn(x_s2, s2, panoptic=panoptic, mask_token=mask_token)
             if solver_type == 'dpm_solver':
                 x_t = (
                     (sigma_t / sigma_s)[(...,) + (None,)*dims] * x
@@ -701,20 +701,20 @@ class DPM_Solver:
             phi_3 = phi_2 / h - 0.5
 
             if noise_s is None:
-                noise_s = self.model_fn(x, s, panoptic=panoptic)
+                noise_s = self.model_fn(x, s, panoptic=panoptic, mask_token=mask_token)
             if noise_s1 is None:
                 x_s1 = (
                     torch.exp(log_alpha_s1 - log_alpha_s)[(...,) + (None,)*dims] * x
                     - (sigma_s1 * phi_11)[(...,) + (None,)*dims] * noise_s
                 )
-                noise_s1 = self.model_fn(x_s1, s1, panoptic=panoptic)
+                noise_s1 = self.model_fn(x_s1, s1, panoptic=panoptic, mask_token=mask_token)
             if noise_s2 is None:
                 x_s2 = (
                     torch.exp(log_alpha_s2 - log_alpha_s)[(...,) + (None,)*dims] * x
                     - (sigma_s2 * phi_12)[(...,) + (None,)*dims] * noise_s
                     - r2 / r1 * (sigma_s2 * phi_22)[(...,) + (None,)*dims] * (noise_s1 - noise_s)
                 )
-                noise_s2 = self.model_fn(x_s2, s2, panoptic=panoptic)
+                noise_s2 = self.model_fn(x_s2, s2, panoptic=panoptic, mask_token=mask_token)
             if solver_type == 'dpm_solver':
                 #TODO: multiply predicted noise with panoptic mask. 
                 x_t = (
@@ -741,7 +741,7 @@ class DPM_Solver:
         else:
             return x_t
 
-    def dpm_solver_update(self, x, s, t, order, return_noise=False, solver_type='dpm_solver', r1=None, r2=None, panoptic=None):
+    def dpm_solver_update(self, x, s, t, order, return_noise=False, solver_type='dpm_solver', r1=None, r2=None, panoptic=None, mask_token=None):
         """
         A single step for DPM-Solver of the given order `order`.
 
@@ -754,11 +754,11 @@ class DPM_Solver:
             x_t: A pytorch tensor. The approximated solution at time `t`.
         """
         if order == 1:
-            return self.dpm_solver_first_update(x, s, t, return_noise=return_noise, panoptic=panoptic)
+            return self.dpm_solver_first_update(x, s, t, return_noise=return_noise, panoptic=panoptic, mask_token=mask_token)
         elif order == 2:
-            return self.dpm_solver_second_update(x, s, t, return_noise=return_noise, solver_type=solver_type, r1=r1, panoptic=panoptic)
+            return self.dpm_solver_second_update(x, s, t, return_noise=return_noise, solver_type=solver_type, r1=r1, panoptic=panoptic, mask_token=mask_token)
         elif order == 3:
-            return self.dpm_solver_third_update(x, s, t, return_noise=return_noise, solver_type=solver_type, r1=r1, r2=r2, panoptic=panoptic)
+            return self.dpm_solver_third_update(x, s, t, return_noise=return_noise, solver_type=solver_type, r1=r1, r2=r2, panoptic=panoptic, mask_token=mask_token)
         else:
             raise ValueError("Solver order must be 1 or 2 or 3, got {}".format(order))
 
@@ -839,7 +839,7 @@ class DPM_Solver:
 
     def sample(self, x, steps=10, eps=1e-4, T=None, order=3, panoptic=None, skip_type='time_uniform',
         denoise=False, method='fast', solver_type='dpm_solver', atol=0.0078,
-        rtol=0.05,
+        rtol=0.05, mask_token=None
     ):
         """
         Compute the sample at time `eps` by DPM-Solver, given the initial `x` at time `T`.
@@ -938,17 +938,20 @@ class DPM_Solver:
                     h = self.noise_schedule.marginal_lambda(timesteps[i + order]) - self.noise_schedule.marginal_lambda(timesteps[i])
                     r1 = None if order <= 1 else (self.noise_schedule.marginal_lambda(timesteps[i + 1]) - self.noise_schedule.marginal_lambda(timesteps[i])) / h
                     r2 = None if order <= 2 else (self.noise_schedule.marginal_lambda(timesteps[i + 2]) - self.noise_schedule.marginal_lambda(timesteps[i])) / h
-                    x = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type, r1=r1, r2=r2, panoptic=panoptic)
+                    x = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type, r1=r1, r2=r2, panoptic=panoptic, mask_token=mask_token)
                     i += order
         elif method == 'singlestep':
             N_steps = steps // order
             orders = [order,] * N_steps
             timesteps = self.get_time_steps(skip_type=skip_type, t_T=t_T, t_0=t_0, N=N_steps, device=device)
             assert len(timesteps) - 1 == N_steps
+            #TODO: should we iteratively generate the mask by steps???
+            pred_mask = mask_token
             with torch.no_grad():
                 for i, order in enumerate(orders):
                     vec_s, vec_t = torch.ones((x.shape[0],)).to(device) * timesteps[i], torch.ones((x.shape[0],)).to(device) * timesteps[i + 1]
-                    x = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic)
+                    x, pred_mask = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=pred_mask)
+            return x, pred_mask
         if denoise:
             x = self.denoise_fn(x, torch.ones((x.shape[0],)).to(device) * t_0)
         return x

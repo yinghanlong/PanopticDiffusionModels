@@ -156,7 +156,7 @@ class UViT(nn.Module):
 
         self.extras = 1 + num_clip_token
 
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.extras + num_patches, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.extras + 2*num_patches, embed_dim)) #TODO:changed to 2
 
         self.in_blocks = nn.ModuleList([
             Block(
@@ -179,6 +179,10 @@ class UViT(nn.Module):
         self.decoder_pred = nn.Linear(embed_dim, self.patch_dim, bias=True)
         self.final_layer = nn.Conv2d(self.in_chans, self.in_chans, 3, padding=1) if conv else nn.Identity()
 
+        #TODO:add layers for panoptic segmentation masks
+        #self.decoder_pred_mask = nn.Linear(embed_dim, self.patch_dim, bias=True)
+        self.final_layer_mask =nn.Conv2d(self.in_chans, self.in_chans, 3, padding=1) if conv else nn.Identity()
+
         trunc_normal_(self.pos_embed, std=.02)
         self.apply(self._init_weights)
 
@@ -195,15 +199,21 @@ class UViT(nn.Module):
     def no_weight_decay(self):
         return {'pos_embed'}
 
-    def forward(self, x, timesteps, context):
+    def forward(self, x, timesteps, context, mask_token=None):
         x = self.patch_embed(x)
         B, L, D = x.shape
 
         time_token = self.time_embed(timestep_embedding(timesteps, self.embed_dim))
         time_token = time_token.unsqueeze(dim=1)
         context_token = self.context_embed(context)
-        x = torch.cat((time_token, context_token, x), dim=1)
-        x = x + self.pos_embed
+        #TODO: add mask token randomly initialized
+        if mask_token is not None:
+            mask_token=self.patch_embed(mask_token)
+            x = torch.cat((time_token, context_token, x, mask_token), dim=1)
+            x = x + self.pos_embed
+        else:
+            x = torch.cat((time_token, context_token, x), dim=1)
+            x = x + self.pos_embed[:, :self.extras + L, :]
 
         skips = []
         for blk in self.in_blocks:
@@ -217,8 +227,19 @@ class UViT(nn.Module):
 
         x = self.norm(x)
         x = self.decoder_pred(x)
-        assert x.size(1) == self.extras + L
-        x = x[:, self.extras:, :]
-        x = unpatchify(x, self.in_chans)
-        x = self.final_layer(x)
-        return x
+        #predict noise, use only x queries, ignore mask queries
+        if mask_token is not None:
+            assert x.size(1) == self.extras + 2*L
+        noise = x[:, self.extras:self.extras + L, :]
+        noise = unpatchify(noise, self.in_chans)
+        noise = self.final_layer(noise)
+
+        #TODO: generate panoptic segmentation masks, use only mask queries
+        if mask_token is not None:
+            y = x[:, self.extras+L:, :]
+            y = unpatchify(y, self.in_chans)
+            y = self.final_layer_mask(y)
+
+            return noise, y 
+        else:
+            return noise

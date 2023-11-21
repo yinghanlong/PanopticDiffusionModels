@@ -516,7 +516,9 @@ class MSCOCODatabase(Dataset):
         segmentation = np.array(segmentation).astype(np.uint8)
         segmentation = center_crop(self.width, self.height, segmentation).astype(np.float32)
         if self.use_category_id==True:
-            segmentation = (segmentation/ 100 - 1.0).astype(np.float32) #category id's range is 1-200
+            #NOTE:try using the category id directly, do not scale
+            segmentation = segmentation
+            #segmentation = (segmentation/ 100 - 1.0).astype(np.float32) #category id's range is 1-200
         else:
             segmentation = (segmentation/ 127.5 - 1.0).astype(np.float32) 
         segmentation = einops.rearrange(segmentation, 'h w c -> c h w')
@@ -557,7 +559,10 @@ class MSCOCOFeatureDataset(Dataset):
 
         #TODO: load panoptic segmentation info
         if self.use_category_id == True:
-            s = np.load(os.path.join(self.root, f'{index}_p.npy'))
+            #Note: use id directly, no scaling, no pooling
+            s = np.load(os.path.join(self.root, f'{index}_seg.npy'))
+            #use scaled id
+            #s = np.load(os.path.join(self.root, f'{index}_p.npy'))
             #pool from size (3,256,256) to (1,32,32)
             s = skimage.measure.block_reduce(s, (3,8,8), np.min)
         else: #use encoded panoptic map

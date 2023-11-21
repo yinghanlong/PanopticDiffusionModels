@@ -318,6 +318,7 @@ class DPM_Solver:
                 s = torch.quantile(torch.abs(x0).reshape((x0.shape[0], -1)), p, dim=1)
                 s = torch.maximum(s, torch.ones_like(s).to(s.device))[(...,) + (None,)*dims]
                 x0 = torch.clamp(x0, -s, s) / (s / self.max_val)
+            
             return x0, pred_mask
         else:
             return self.model(x, t, panoptic=panoptic, mask_token=mask_token)
@@ -435,15 +436,22 @@ class DPM_Solver:
         if self.predict_x0:
             phi_1 = (torch.exp(-h) - 1.) / (-1.)
             if noise_s is None:
-                noise_s, pred_mask = self.model_fn(x, s, panoptic=panoptic, mask_token=mask_token)
+                noise_s, pred_mask = self.model_fn(x, s, panoptic=panoptic, mask_token=mask_token) #noise_s is x0 when predict_x0=true
             x_t = (
                 (sigma_t / sigma_s)[(...,) + (None,)*dims] * x
                 + (alpha_t * phi_1)[(...,) + (None,)*dims] * noise_s
             )
+            #compute mask t, the iterative input for the next step
+            #Note: use mask labels
+            mask_label = torch.max(pred_mask, dim=1,keepdim=True)[1].float()
+            mask_t = (
+                (sigma_t / sigma_s)[(...,) + (None,)*dims] * mask_token
+                + (alpha_t * phi_1)[(...,) + (None,)*dims] * mask_label
+            )
             if return_noise:
                 return x_t, {'noise_s': noise_s}
             else:
-                return x_t, pred_mask
+                return x_t, pred_mask, mask_t
         else:
             phi_1 = torch.expm1(h)
             if noise_s is None:
@@ -452,10 +460,16 @@ class DPM_Solver:
                 torch.exp(log_alpha_t - log_alpha_s)[(...,) + (None,)*dims] * x
                 - (sigma_t * phi_1)[(...,) + (None,)*dims] * noise_s
             )
+            #Note: use mask labels
+            mask_label = torch.max(pred_mask, dim=1,keepdim=True)[1].float()
+            mask_t = (
+                torch.exp(log_alpha_t - log_alpha_s)[(...,) + (None,)*dims] * mask_token
+                - (sigma_t * phi_1)[(...,) + (None,)*dims] * mask_label
+            )
             if return_noise:
                 return x_t, {'noise_s': noise_s}
             else:
-                return x_t, pred_mask
+                return x_t, pred_mask,mask_t
 
     def dpm_solver_second_update(self, x, s, t, r1=0.5, noise_s=None, return_noise=False, solver_type='dpm_solver', panoptic=None, mask_token=None):
         """
@@ -946,11 +960,11 @@ class DPM_Solver:
             timesteps = self.get_time_steps(skip_type=skip_type, t_T=t_T, t_0=t_0, N=N_steps, device=device)
             assert len(timesteps) - 1 == N_steps
             #TODO: should we iteratively generate the mask by steps???
-            pred_mask = mask_token
+            mask_t = mask_token
             with torch.no_grad():
                 for i, order in enumerate(orders):
                     vec_s, vec_t = torch.ones((x.shape[0],)).to(device) * timesteps[i], torch.ones((x.shape[0],)).to(device) * timesteps[i + 1]
-                    x, pred_mask = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=pred_mask)
+                    x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t)
             return x, pred_mask
         if denoise:
             x = self.denoise_fn(x, torch.ones((x.shape[0],)).to(device) * t_0)

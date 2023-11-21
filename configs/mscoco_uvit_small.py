@@ -19,7 +19,7 @@ def get_config():
 
     config.train = d(
         n_steps=1000000,#1000000
-        batch_size=128,#256
+        batch_size=64,#128,#256
         log_interval=10,
         eval_interval=5000,
         save_interval=50000,
@@ -62,7 +62,7 @@ def get_config():
     config.sample = d(
         sample_steps=50,
         n_samples=30000,
-        mini_batch_size=32,#50
+        mini_batch_size=32,
         cfg=True,
         scale=1.,
         path='/home/nano01/a/long273/results/sample'

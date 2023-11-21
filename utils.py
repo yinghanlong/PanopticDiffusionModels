@@ -3,9 +3,11 @@ import torch.nn as nn
 import numpy as np
 import os
 from tqdm import tqdm
-from torchvision.utils import save_image, make_grid
+from torchvision.utils import save_image, make_grid, draw_segmentation_masks
 from absl import logging
 import wandb
+from panopticapi.utils import IdGenerator
+import json
 
 
 def set_logger(log_level='info', fname=None):
@@ -159,31 +161,66 @@ def amortize(n_samples, batch_size):
     r = n_samples % batch_size
     return k * [batch_size] if r == 0 else k * [batch_size] + [r]
 
+def category2rgb(color_generator,id_map, categegories):
+    
+    rgb_shape = tuple([3]+list(id_map.shape))
+    rgb_map = torch.zeros(rgb_shape, dtype=torch.uint8)
+    for i in range(id_map.shape[0]):
+        for j in range(id_map.shape[1]):
+            c=id_map[i,j].item()
+            while c not in categegories:
+                c-=1
+                if c==0:
+                    c=1
+                    break
+            rgb_map[:,i,j] = torch.tensor(color_generator.get_color(c))
+        
+    return rgb_map
 
 def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unpreprocess_fn=None, step=None, use_panoptic=False):
     os.makedirs(path, exist_ok=True)
     idx = 0
     batch_size = mini_batch_size * accelerator.num_processes
     loss_mask_all= []
+    panoptic_coco_categories = '../panopticapi-master/panoptic_coco_categories.json'
+
+    with open(panoptic_coco_categories, 'r') as f:
+        categories_list = json.load(f)
+    categegories = {category['id']: category for category in categories_list}
+
+    color_generator=IdGenerator(categegories)
     for _batch_size in tqdm(amortize(n_samples, batch_size), disable=not accelerator.is_main_process, desc='sample2dir'):
         if use_panoptic==False:
-            samples = sample_fn(mini_batch_size)
+            samples = sample_fn(mini_batch_size, use_panoptic=False)
         else:
-            samples, pred_mask, loss_mask = sample_fn(mini_batch_size)
+            samples, pred_mask, loss_mask = sample_fn(mini_batch_size,use_panoptic=True)
             #TODO:accumulate loss
             loss_mask_all.append(loss_mask)
+            pred_mask = accelerator.gather(pred_mask.contiguous())[:_batch_size]
         samples = unpreprocess_fn(samples)
         samples = accelerator.gather(samples.contiguous())[:_batch_size]
         if accelerator.is_main_process:
             if idx==0 and (step is not None) and use_panoptic==True: #visualize in wandb
                 grid_samples = make_grid(samples, 8)
                 wandb.log({'eval_samples': wandb.Image(grid_samples)}, step)
-                grid_mask = make_grid(unpreprocess_fn(pred_mask), 8)
+                mask_max, mask_label = torch.max(pred_mask,dim=1, keepdim=True)#indices
+                #color_mask = torch.zeros_like(pred_mask)
+                #for i in range(mask_label.shape[0]):
+                #    color_mask[i,...] = category2rgb(color_generator,mask_label[i,...],categegories)
+                #TODO: print colored maps
+                color_masks = torch.zeros_like(pred_mask, dtype=bool) #[b,200,h,w]
+                color_masks[pred_mask==mask_max] = 1
+                empty_image = torch.zeros(pred_mask.shape[0],3,32,32, dtype=torch.uint8)
+                for i in range(pred_mask.shape[0]):
+                    logging.info('Color masks...',i)
+                    empty_image[i,:,:,:]= draw_segmentation_masks(empty_image[i,:,:,:], color_masks[i,:,:,:])   
+                grid_mask = make_grid(empty_image.float() , 5, normalize=True) 
+                #grid_mask = make_grid(mask_label.float(), 8, normalize=True)
                 wandb.log({'pred_mask': wandb.Image(grid_mask)}, step)
             for sample in samples:
                 save_image(sample, os.path.join(path, f"{idx}.png"))
                 idx += 1
-    if use_panoptic==True and step is not None:
+    if use_panoptic==True and (step is not None):
         wandb.log({f'eval_loss_mask': torch.mean(torch.stack(loss_mask_all))}, step)
 
 

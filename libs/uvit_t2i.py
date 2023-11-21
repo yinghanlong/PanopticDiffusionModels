@@ -129,16 +129,19 @@ class PatchEmbed(nn.Module):
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
+        if len(x.shape)==3:
+            x=torch.unsqueeze(x,1)
         B, C, H, W = x.shape
+        #print(x.shape)
         assert H % self.patch_size == 0 and W % self.patch_size == 0
-        x = self.proj(x).flatten(2).transpose(1, 2)
+        x = self.proj(x).flatten(2).transpose(1, 2) #output shape= B L C, L=patch_h*patch_w
         return x
 
 
 class UViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.,
                  qkv_bias=False, qk_scale=None, norm_layer=nn.LayerNorm, mlp_time_embed=False, use_checkpoint=False,
-                 clip_dim=768, num_clip_token=77, conv=True, skip=True):
+                 clip_dim=768, num_clip_token=77, conv=True, skip=True, num_panoptic_class=201):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.in_chans = in_chans
@@ -180,8 +183,11 @@ class UViT(nn.Module):
         self.final_layer = nn.Conv2d(self.in_chans, self.in_chans, 3, padding=1) if conv else nn.Identity()
 
         #TODO:add layers for panoptic segmentation masks
-        #self.decoder_pred_mask = nn.Linear(embed_dim, self.patch_dim, bias=True)
-        self.final_layer_mask =nn.Conv2d(self.in_chans, self.in_chans, 3, padding=1) if conv else nn.Identity()
+        self.mask_embed=PatchEmbed(patch_size=patch_size, in_chans=1, embed_dim=embed_dim) #map category id to embed dim
+        self.decoder_pred_mask = nn.Linear(embed_dim, self.patch_dim, bias=True)
+        #self.final_layer_mask =nn.Conv2d(self.in_chans, self.in_chans, 3, padding=1) if conv else nn.Identity()
+        #NOTE: predict category ids and then use cross entropy loss
+        self.final_layer_mask =nn.Conv2d(self.in_chans, num_panoptic_class,3, padding=1) if conv else nn.Identity()
 
         trunc_normal_(self.pos_embed, std=.02)
         self.apply(self._init_weights)
@@ -208,7 +214,7 @@ class UViT(nn.Module):
         context_token = self.context_embed(context)
         #TODO: add mask token randomly initialized
         if mask_token is not None:
-            mask_token=self.patch_embed(mask_token)
+            mask_token=self.mask_embed(mask_token)
             x = torch.cat((time_token, context_token, x, mask_token), dim=1)
             x = x + self.pos_embed
         else:
@@ -226,17 +232,18 @@ class UViT(nn.Module):
             x = blk(x, skips.pop())
 
         x = self.norm(x)
-        x = self.decoder_pred(x)
+        noise = self.decoder_pred(x[:, self.extras:self.extras + L, :])
         #predict noise, use only x queries, ignore mask queries
-        if mask_token is not None:
-            assert x.size(1) == self.extras + 2*L
-        noise = x[:, self.extras:self.extras + L, :]
+        #if mask_token is not None:
+        #    assert x.size(1) == self.extras + *L
+        #noise = x[:, self.extras:self.extras + L, :]
         noise = unpatchify(noise, self.in_chans)
         noise = self.final_layer(noise)
 
         #TODO: generate panoptic segmentation masks, use only mask queries
         if mask_token is not None:
-            y = x[:, self.extras+L:, :]
+            y = self.decoder_pred_mask(x[:, self.extras+L:, :])
+            #y = x[:, self.extras+L:, :]
             y = unpatchify(y, self.in_chans)
             y = self.final_layer_mask(y)
 

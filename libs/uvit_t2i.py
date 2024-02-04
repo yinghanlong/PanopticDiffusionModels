@@ -95,27 +95,59 @@ class Attention(nn.Module):
 class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, skip=False, use_checkpoint=False):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, skip=False, use_checkpoint=False, enable_panoptic=True):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale)
+        #TODO: add an image self attention without mask, set enable_panoptic to True
+        self.enable_panoptic=enable_panoptic
+        if enable_panoptic==True:
+            self.attn_image = Attention(
+                dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale)
+            self.norm_image= norm_layer(dim)
+
+            self.attn_mask = Attention(
+                dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale)
+            self.norm_mask= norm_layer(dim)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)
         self.skip_linear = nn.Linear(2 * dim, dim) if skip else None
         self.use_checkpoint = use_checkpoint
 
-    def forward(self, x, skip=None):
+    def forward(self, x, skip=None, extra_dims=0):
         if self.use_checkpoint:
-            return torch.utils.checkpoint.checkpoint(self._forward, x, skip)
+            return torch.utils.checkpoint.checkpoint(self._forward, x, skip, extra_dims)
         else:
             return self._forward(x, skip)
 
-    def _forward(self, x, skip=None):
+    def _forward(self, x, skip=None, extra_dims=0):
         if self.skip_linear is not None:
             x = self.skip_linear(torch.cat([x, skip], dim=-1))
         x = x + self.attn(self.norm1(x))
+        #TODO: separate image/panoptic segmentation mask attention
+        if self.enable_panoptic:
+            B, L, D = x.shape
+            len_image= extra_dims+ (L- extra_dims)//2 
+            
+            '''
+            #TODO:ry add extra feauture (text/time embedding) to masks
+            norm_x=self.norm_image(x)
+            extra_feat= norm_x[:,:extra_dims,:]
+            image_attn= self.attn_image( norm_x[:,:len_image,:])
+            mask_tensor= norm_x[:,len_image:,:]
+            mask_attn= self.attn_mask( torch.cat((extra_feat,mask_tensor), dim=1))
+            '''
+
+            mask_tensor= x[:,len_image:,:]
+            image_attn= self.attn_image( self.norm_image(x[:,:len_image,:]))
+            mask_attn= self.attn_mask( self.norm_mask(mask_tensor))
+            #zero_tensor= torch.zeros(B, L-len_image, D, device=image_attn.device)
+            all_attn= torch.cat((image_attn,mask_attn), dim=1)
+            #residual connection
+            x = x + all_attn
+
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -138,10 +170,10 @@ class PatchEmbed(nn.Module):
         return x
 
 
-class UViT(nn.Module):
+class UViT(nn.Module): #TODO: set the flags!!!
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.,
                  qkv_bias=False, qk_scale=None, norm_layer=nn.LayerNorm, mlp_time_embed=False, use_checkpoint=False,
-                 clip_dim=768, num_clip_token=77, conv=True, skip=True, num_panoptic_class=201):
+                 clip_dim=768, num_clip_token=77, conv=True, skip=True, num_panoptic_class=201, enable_panoptic=True, use_ground_truth=True):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.in_chans = in_chans
@@ -164,17 +196,17 @@ class UViT(nn.Module):
         self.in_blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                norm_layer=norm_layer, use_checkpoint=use_checkpoint)
+                norm_layer=norm_layer, use_checkpoint=use_checkpoint, enable_panoptic=enable_panoptic) #note:set to true
             for _ in range(depth // 2)])
 
         self.mid_block = Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                norm_layer=norm_layer, use_checkpoint=use_checkpoint)
+                norm_layer=norm_layer, use_checkpoint=use_checkpoint,enable_panoptic=enable_panoptic)
 
         self.out_blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                norm_layer=norm_layer, skip=skip, use_checkpoint=use_checkpoint)
+                norm_layer=norm_layer, skip=skip, use_checkpoint=use_checkpoint,enable_panoptic=enable_panoptic)
             for _ in range(depth // 2)])
 
         self.norm = norm_layer(embed_dim)
@@ -185,9 +217,11 @@ class UViT(nn.Module):
         #TODO:add layers for panoptic segmentation masks
         self.mask_embed=PatchEmbed(patch_size=patch_size, in_chans=1, embed_dim=embed_dim) #map category id to embed dim
         self.decoder_pred_mask = nn.Linear(embed_dim, self.patch_dim, bias=True)
-        #self.final_layer_mask =nn.Conv2d(self.in_chans, self.in_chans, 3, padding=1) if conv else nn.Identity()
+        
         #NOTE: predict category ids and then use cross entropy loss
         self.final_layer_mask =nn.Conv2d(self.in_chans, num_panoptic_class,3, padding=1) if conv else nn.Identity()
+        #NOTE: set to true if input ground truth mask
+        self.use_ground_truth=use_ground_truth
 
         trunc_normal_(self.pos_embed, std=.02)
         self.apply(self._init_weights)
@@ -214,8 +248,8 @@ class UViT(nn.Module):
         context_token = self.context_embed(context)
         #TODO: add mask token randomly initialized
         if mask_token is not None:
-            mask_token=self.mask_embed(mask_token)
-            x = torch.cat((time_token, context_token, x, mask_token), dim=1)
+            mask_embedding=self.mask_embed(mask_token)
+            x = torch.cat((time_token, context_token, x, mask_embedding), dim=1)
             x = x + self.pos_embed
         else:
             x = torch.cat((time_token, context_token, x), dim=1)
@@ -223,30 +257,45 @@ class UViT(nn.Module):
 
         skips = []
         for blk in self.in_blocks:
-            x = blk(x)
+            x = blk(x, extra_dims=self.extras )
             skips.append(x)
 
-        x = self.mid_block(x)
+        x = self.mid_block(x, extra_dims=self.extras )
 
         for blk in self.out_blocks:
-            x = blk(x, skips.pop())
+            x = blk(x, skips.pop(), extra_dims=self.extras )
 
         x = self.norm(x)
-        noise = self.decoder_pred(x[:, self.extras:self.extras + L, :])
         #predict noise, use only x queries, ignore mask queries
         #if mask_token is not None:
         #    assert x.size(1) == self.extras + *L
         #noise = x[:, self.extras:self.extras + L, :]
-        noise = unpatchify(noise, self.in_chans)
-        noise = self.final_layer(noise)
 
         #TODO: generate panoptic segmentation masks, use only mask queries
         if mask_token is not None:
-            y = self.decoder_pred_mask(x[:, self.extras+L:, :])
-            #y = x[:, self.extras+L:, :]
-            y = unpatchify(y, self.in_chans)
-            y = self.final_layer_mask(y)
+            #TODO: Jan17 use ground truth mask, do not predict it
+            if self.use_ground_truth==True:
+                mask_feature=x[:, self.extras+L:, :]
+                image_feature=x[:, self.extras:self.extras + L, :]
+                #merge together
+                image_feature=image_feature+mask_feature
+                noise = self.decoder_pred(image_feature)
+                #ground truth mask
+                y= mask_token
+            else:
+                noise = self.decoder_pred(x[:, self.extras:self.extras + L, :])
+                y = self.decoder_pred_mask(x[:, self.extras+L:, :])
+                #y = x[:, self.extras+L:, :]
+                y = unpatchify(y, self.in_chans)
+                y = self.final_layer_mask(y)
 
+        else:
+            noise = self.decoder_pred(x[:, self.extras:self.extras + L, :])
+
+        noise = unpatchify(noise, self.in_chans)
+        noise = self.final_layer(noise)
+
+        if mask_token is not None:
             return noise, y 
         else:
             return noise

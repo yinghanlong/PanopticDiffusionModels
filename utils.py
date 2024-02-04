@@ -212,16 +212,16 @@ def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unprepr
                 color_masks[pred_mask==mask_max] = 1
                 empty_image = torch.zeros(pred_mask.shape[0],3,32,32, dtype=torch.uint8)
                 for i in range(pred_mask.shape[0]):
-                    logging.info('Color masks...',i)
-                    empty_image[i,:,:,:]= draw_segmentation_masks(empty_image[i,:,:,:], color_masks[i,:,:,:])   
+                    logging.info(f'Color masks...{i}')
+                    empty_image[i,:,:,:]= draw_segmentation_masks(empty_image[i,:,:,:], color_masks[i,:,:,:],alpha=0.7)   
                 grid_mask = make_grid(empty_image.float() , 5, normalize=True) 
                 #grid_mask = make_grid(mask_label.float(), 8, normalize=True)
                 wandb.log({'pred_mask': wandb.Image(grid_mask)}, step)
             for sample in samples:
                 save_image(sample, os.path.join(path, f"{idx}.png"))
                 idx += 1
-    if use_panoptic==True and (step is not None):
-        wandb.log({f'eval_loss_mask': torch.mean(torch.stack(loss_mask_all))}, step)
+    #if use_panoptic==True and (step is not None):
+    #    wandb.log({f'eval_loss_mask': torch.mean(torch.stack(loss_mask_all))}, step)
 
 
 def grad_norm(model):

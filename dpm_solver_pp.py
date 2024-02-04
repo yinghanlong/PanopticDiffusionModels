@@ -413,7 +413,7 @@ class DPM_Solver:
         )
         return x_0
 
-    def dpm_solver_first_update(self, x, s, t, noise_s=None, return_noise=False, panoptic=None, mask_token=None):
+    def dpm_solver_first_update(self, x, s, t, noise_s=None, return_noise=False, panoptic=None, mask_token=None, enable_mask_opt=False):
         """
         A single step for DPM-Solver-1.
 
@@ -440,18 +440,23 @@ class DPM_Solver:
             x_t = (
                 (sigma_t / sigma_s)[(...,) + (None,)*dims] * x
                 + (alpha_t * phi_1)[(...,) + (None,)*dims] * noise_s
-            )
+            ) #x: x at previous t; noise_s: x0  
             #compute mask t, the iterative input for the next step
             #Note: use mask labels
-            mask_label = torch.max(pred_mask, dim=1,keepdim=True)[1].float()
-            mask_t = (
-                (sigma_t / sigma_s)[(...,) + (None,)*dims] * mask_token
-                + (alpha_t * phi_1)[(...,) + (None,)*dims] * mask_label
-            )
+            if enable_mask_opt==True:
+                mask_label = torch.max(pred_mask, dim=1,keepdim=True)[1].float()
+                #scale mask input to [-1,1]. This is M0. mask_token is M[t]
+                scaled_mask = mask_label/ 100.0 - 1.0 #category id's range is 1-200
+                mask_t = (
+                    (sigma_t / sigma_s)[(...,) + (None,)*dims] * mask_token
+                    + (alpha_t * phi_1)[(...,) + (None,)*dims] * scaled_mask #mask_label
+                )
+
+                return x_t, pred_mask, mask_t
             if return_noise:
                 return x_t, {'noise_s': noise_s}
             else:
-                return x_t, pred_mask, mask_t
+                return x_t, pred_mask, pred_mask
         else:
             phi_1 = torch.expm1(h)
             if noise_s is None:
@@ -461,10 +466,11 @@ class DPM_Solver:
                 - (sigma_t * phi_1)[(...,) + (None,)*dims] * noise_s
             )
             #Note: use mask labels
-            mask_label = torch.max(pred_mask, dim=1,keepdim=True)[1].float()
+            mask_label = torch.max(pred_mask, dim=1,keepdim=True)[1].float()#scale mask input to [-1,1]. This is M0. mask_token is M[t]
+            scaled_mask = mask_label/ 100.0 - 1.0#category id's range is 1-200
             mask_t = (
                 torch.exp(log_alpha_t - log_alpha_s)[(...,) + (None,)*dims] * mask_token
-                - (sigma_t * phi_1)[(...,) + (None,)*dims] * mask_label
+                - (sigma_t * phi_1)[(...,) + (None,)*dims] * scaled_mask
             )
             if return_noise:
                 return x_t, {'noise_s': noise_s}
@@ -959,13 +965,13 @@ class DPM_Solver:
             orders = [order,] * N_steps
             timesteps = self.get_time_steps(skip_type=skip_type, t_T=t_T, t_0=t_0, N=N_steps, device=device)
             assert len(timesteps) - 1 == N_steps
-            #TODO: should we iteratively generate the mask by steps???
+            #NOTE:iteratively generate the mask by steps
             mask_t = mask_token
             with torch.no_grad():
                 for i, order in enumerate(orders):
                     vec_s, vec_t = torch.ones((x.shape[0],)).to(device) * timesteps[i], torch.ones((x.shape[0],)).to(device) * timesteps[i + 1]
                     x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t)
-            return x, pred_mask
+            return x, pred_mask #pred_mask size:[N,200,H,W], mask_t size:[N,1,H,W]
         if denoise:
             x = self.denoise_fn(x, torch.ones((x.shape[0],)).to(device) * t_0)
         return x

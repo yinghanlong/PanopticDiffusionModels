@@ -98,7 +98,7 @@ class Schedule(object):  # discrete time
         xn = stp(self.cum_alphas[n] ** 0.5, x0) + stp(self.cum_betas[n] ** 0.5, eps)
         #TODO: use another noise for panoptic segmentation mask
         if panoptic is None:
-            return torch.tensor(n, device=x0.device), eps, xn, eps_m, mask_n
+            return torch.tensor(n, device=x0.device), eps, xn
         else:
             #print('panoptic shape ',panoptic.shape ) #batch, 1, 32,32
             eps_m = torch.randn_like(panoptic) #random noise
@@ -108,16 +108,23 @@ class Schedule(object):  # discrete time
     def __repr__(self):
         return f'Schedule({self.betas[:10]}..., {self.N})'
 
-
-def LSimple(x0, nnet, schedule,  loss_func, panoptic=None, **kwargs):
+#TODO: Set the flag to True to input ground truth panoptic mask to the model
+use_ground_truth=True
+def LSimple(x0, nnet, schedule,  loss_func, panoptic=None,**kwargs):
     if panoptic is None:
         n, eps, xn = schedule.sample(x0)  # n in {1, ..., 1000}
         eps_pred, mask_pred = nnet(xn, n, **kwargs) 
     else:
+        #scale panoptic to [-1,1]
+        scaled_panoptic = (panoptic/ 100.0 - 1.0) #category id's range is 1-200
         #TODO: use another noise for panoptic segmentation mask
-        n, eps, xn, eps_m, mask_n = schedule.sample(x0, panoptic)  # n in {1, ..., 1000}
+        n, eps, xn, eps_m, mask_n = schedule.sample(x0, scaled_panoptic)  # n in {1, ..., 1000}
         #Run the diffusion model to predict noises from image xn and panoptic segmentation mask mask_n 
-        eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=mask_n) 
+        #TODO: Jan17: test use ground truth panoptic mask
+        if use_ground_truth==True:
+            eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=scaled_panoptic) 
+        else:
+            eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=mask_n) 
     #TODO: sum the losses
     loss_eps = mos(eps - eps_pred)
     if panoptic is None:
@@ -127,7 +134,10 @@ def LSimple(x0, nnet, schedule,  loss_func, panoptic=None, **kwargs):
         #mask_label = torch.max(mask_pred, dim=1,keepdim=True)[1]
         panoptic=panoptic.squeeze(1).type(torch.long)
         #print('check masks',mask_pred.shape, panoptic.min(),panoptic.max()) #0-200
-        loss_mask =  loss_func(mask_pred, panoptic).mean()
+        if use_ground_truth==True:
+            loss_mask= loss_eps
+        else:
+            loss_mask =  loss_func(mask_pred, panoptic).mean()
         return loss_eps, loss_mask
 
 
@@ -231,7 +241,11 @@ def train(config):
         _metrics['loss'] = accelerator.gather(loss_eps.detach()).mean()
         _metrics['loss_mask'] = accelerator.gather(loss_mask.detach()).mean()
         #TODO: backpropagate the sum of losses
-        loss_sum = loss_eps + loss_mask
+        #TODO: Jan17 test use ground truth mask
+        if use_ground_truth==True:
+            loss_sum = loss_eps 
+        else:
+            loss_sum = loss_eps  + loss_mask
         accelerator.backward(loss_sum.mean())
         optimizer.step()
         lr_scheduler.step()
@@ -243,9 +257,13 @@ def train(config):
         #TODO: modify sampling to add panoptic mask
         #add a input panoptic 
         _z_init = torch.randn(_n_samples, *config.z_shape, device=device)
-        #TODO: initial as random
-        #mask_token = torch.zeros(_n_samples, *config.z_shape, device=device)
-        mask_token = torch.randn(*panoptic.shape, device=device)
+        #TODO: Jan17 use ground truth mask
+        if use_ground_truth==True:
+            scaled_panoptic= (panoptic/ 100.0 - 1.0)
+            mask_token =  scaled_panoptic
+        else:
+            #initial as random
+            mask_token = torch.randn(*panoptic.shape, device=device)
         #print('panoptic shape ',panoptic.shape )
         #if panoptic is not None:
         #    _z_init = _z_init* panoptic
@@ -253,9 +271,10 @@ def train(config):
         noise_schedule = NoiseScheduleVP(schedule='discrete', betas=torch.tensor(_betas, device=device).float())
 
         def model_fn(x, t_continuous, panoptic=None, mask_token=None):
+            #Note: panoptic is the ground-truth mask. It is not used in DPM solver!
             t = t_continuous * _schedule.N
-            if panoptic is None:
-                return cfg_nnet(x, t, mask_token=mask_token, **kwargs)
+            if mask_token is None:
+                return cfg_nnet(x, t, **kwargs)
             else:
                 return cfg_nnet(x, t, mask_token=mask_token, **kwargs)
                 #TODO: try division in the backward process
@@ -272,9 +291,12 @@ def train(config):
         #TODO: show predicted mask, evaluate the loss with panoptic
         if panoptic is not None:
             
-            loss_mask =  loss_func(pred_mask, panoptic.squeeze(1).type(torch.long)).mean()
-            #loss_mask =  mos(panoptic- pred_mask)
-            loss_mean = accelerator.gather(loss_mask.detach()).mean()
+            if use_ground_truth==True:
+                loss_mean=1.0
+            else:
+                loss_mask = loss_func(pred_mask, panoptic.squeeze(1).type(torch.long)).mean()
+                ##loss_mask =  mos(panoptic- pred_mask)
+                loss_mean = accelerator.gather(loss_mask.detach()).mean()
             #pred_mask = make_grid(pred_mask, 8)
             #save_image(samples, os.path.join(config.sample_dir, f'{train_state.step}.png'))
             #wandb.log({'pred_mask': wandb.Image(pred_mask)}, step=train_state.step)
@@ -348,8 +370,8 @@ def train(config):
                 color_masks[pred_mask==mask_max] = 1
                 empty_image = torch.zeros(pred_mask.shape[0],3,32,32, dtype=torch.uint8)
                 for i in range(10):
-                    logging.info('Color masks...',i)
-                    empty_image[i,:,:,:]= draw_segmentation_masks(empty_image[i,:,:,:], color_masks[i,:,:,:])   
+                    logging.info(f'Color masks...{i}')
+                    empty_image[i,:,:,:]= draw_segmentation_masks(empty_image[i,:,:,:], color_masks[i,:,:,:], alpha=0.7)   
                 grid_mask = make_grid(empty_image.float() , 5, normalize=True) 
                 logging.info('Print a grid of masks...')
                 #grid_mask = make_grid(mask_label.float() , 5, normalize=True)
@@ -432,7 +454,8 @@ def get_hparams():
     if hparams == '':
         from datetime import datetime
         date= datetime.now().strftime('%Y-%m-%d-%H-%M')
-        hparams = 'coco2017-1-mask-noised-crossentropy'#+date
+        hparams = 'coco2017-1-ground-truth-separate-attn-merge'#+date
+        #hparams = 'coco2017-1-ground-truth-merge'
     return hparams
 
 

@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import math
 import numpy as np
 import torch.distributed as dist
+import utils
 
 
 def interpolate_fn(x: torch.Tensor, xp: torch.Tensor, yp: torch.Tensor) -> torch.Tensor:
@@ -306,11 +307,11 @@ class DPM_Solver:
         self.thresholding = thresholding
         self.max_val = max_val
 
-    def model_fn(self, x, t, panoptic=None, mask_token=None):
+    def model_fn(self, x, t, panoptic=None, mask_token=None,  use_ground_truth=False, enable_panoptic=False):
         #TODO: edit this to give panoptic segment info
         if self.predict_x0:
             alpha_t, sigma_t = self.noise_schedule.marginal_alpha(t), self.noise_schedule.marginal_std(t)
-            noise, pred_mask = self.model(x, t, panoptic=panoptic, mask_token=mask_token)
+            noise, pred_mask = self.model(x, t, panoptic=panoptic, mask_token=mask_token, use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
             dims = len(x.shape) - 1
             x0 = (x - sigma_t[(...,) + (None,)*dims] * noise) / alpha_t[(...,) + (None,)*dims]
             if self.thresholding:
@@ -321,7 +322,7 @@ class DPM_Solver:
             
             return x0, pred_mask
         else:
-            return self.model(x, t, panoptic=panoptic, mask_token=mask_token)
+            return self.model(x, t, panoptic=panoptic, mask_token=mask_token, use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
 
     def get_time_steps(self, skip_type, t_T, t_0, N, device):
         """Compute the intermediate time steps for sampling.
@@ -413,7 +414,7 @@ class DPM_Solver:
         )
         return x_0
 
-    def dpm_solver_first_update(self, x, s, t, noise_s=None, return_noise=False, panoptic=None, mask_token=None, enable_mask_opt=False):
+    def dpm_solver_first_update(self, x, s, t, noise_s=None, return_noise=False, panoptic=None, mask_token=None, enable_mask_opt=True,  use_ground_truth=False, enable_panoptic=False):
         """
         A single step for DPM-Solver-1.
 
@@ -436,7 +437,7 @@ class DPM_Solver:
         if self.predict_x0:
             phi_1 = (torch.exp(-h) - 1.) / (-1.)
             if noise_s is None:
-                noise_s, pred_mask = self.model_fn(x, s, panoptic=panoptic, mask_token=mask_token) #noise_s is x0 when predict_x0=true
+                noise_s, pred_mask = self.model_fn(x, s, panoptic=panoptic, mask_token=mask_token,  use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic) #noise_s is x0 when predict_x0=true
             x_t = (
                 (sigma_t / sigma_s)[(...,) + (None,)*dims] * x
                 + (alpha_t * phi_1)[(...,) + (None,)*dims] * noise_s
@@ -444,15 +445,27 @@ class DPM_Solver:
             #compute mask t, the iterative input for the next step
             #Note: use mask labels
             if enable_mask_opt==True:
+                
+                #Directly use analog bits to generate the next mask
+                mask_t = (
+                    (sigma_t / sigma_s)[(...,) + (None,)*dims] * mask_token
+                    + (alpha_t * phi_1)[(...,) + (None,)*dims] * pred_mask 
+                )
+                '''
+                #Get mask category ids from max idx
                 mask_label = torch.max(pred_mask, dim=1,keepdim=True)[1].float()
                 #scale mask input to [-1,1]. This is M0. mask_token is M[t]
                 scaled_mask = mask_label/ 100.0 - 1.0 #category id's range is 1-200
+                
+                #Test use mask_t directly since we optimize loss(m0, pre_mask) directly
+                #mask_t= scaled_mask
+                
                 mask_t = (
                     (sigma_t / sigma_s)[(...,) + (None,)*dims] * mask_token
                     + (alpha_t * phi_1)[(...,) + (None,)*dims] * scaled_mask #mask_label
                 )
-
-                return x_t, pred_mask, mask_t
+                '''
+                return x_t, pred_mask, mask_t #pred_mask size=[B,200,H,W], mast_t size=[B,1,H,W]
             if return_noise:
                 return x_t, {'noise_s': noise_s}
             else:
@@ -761,7 +774,7 @@ class DPM_Solver:
         else:
             return x_t
 
-    def dpm_solver_update(self, x, s, t, order, return_noise=False, solver_type='dpm_solver', r1=None, r2=None, panoptic=None, mask_token=None):
+    def dpm_solver_update(self, x, s, t, order, return_noise=False, solver_type='dpm_solver', r1=None, r2=None, panoptic=None, mask_token=None, enable_mask_opt=True,  use_ground_truth=False, enable_panoptic=False):
         """
         A single step for DPM-Solver of the given order `order`.
 
@@ -774,7 +787,7 @@ class DPM_Solver:
             x_t: A pytorch tensor. The approximated solution at time `t`.
         """
         if order == 1:
-            return self.dpm_solver_first_update(x, s, t, return_noise=return_noise, panoptic=panoptic, mask_token=mask_token)
+            return self.dpm_solver_first_update(x, s, t, return_noise=return_noise, panoptic=panoptic, mask_token=mask_token, enable_mask_opt=enable_mask_opt,  use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
         elif order == 2:
             return self.dpm_solver_second_update(x, s, t, return_noise=return_noise, solver_type=solver_type, r1=r1, panoptic=panoptic, mask_token=mask_token)
         elif order == 3:
@@ -859,7 +872,7 @@ class DPM_Solver:
 
     def sample(self, x, steps=10, eps=1e-4, T=None, order=3, panoptic=None, skip_type='time_uniform',
         denoise=False, method='fast', solver_type='dpm_solver', atol=0.0078,
-        rtol=0.05, mask_token=None
+        rtol=0.05, mask_token=None, use_twophases=True
     ):
         """
         Compute the sample at time `eps` by DPM-Solver, given the initial `x` at time `T`.
@@ -970,7 +983,19 @@ class DPM_Solver:
             with torch.no_grad():
                 for i, order in enumerate(orders):
                     vec_s, vec_t = torch.ones((x.shape[0],)).to(device) * timesteps[i], torch.ones((x.shape[0],)).to(device) * timesteps[i + 1]
-                    x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t)
+                    ##test starting from initial noise as mask queries at every step
+                    #x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_token)
+                    #if use_twophases==False or i<N_steps/2:#phase one
+                    x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t,enable_mask_opt=True, use_ground_truth=False, enable_panoptic=True)
+                    #else: #phase two, disable mask update, use mask_t from phase one
+                    #    x, pred_mask_feat, mask_feat = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t, enable_mask_opt=False, use_ground_truth=True, enable_panoptic=True)
+                if use_twophases==True:
+                    for i, order in enumerate(orders):
+                        vec_s, vec_t = torch.ones((x.shape[0],)).to(device) * timesteps[i], torch.ones((x.shape[0],)).to(device) * timesteps[i + 1]
+                        x, pred_mask_feat, mask_feat = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t, enable_mask_opt=False, use_ground_truth=True, enable_panoptic=True)
+                
+                #NOTE: for analog bits pred_mask size:[N,8,H,W], mask_t size:[N,8,H,W]
+                
             return x, pred_mask #pred_mask size:[N,200,H,W], mask_t size:[N,1,H,W]
         if denoise:
             x = self.denoise_fn(x, torch.ones((x.shape[0],)).to(device) * t_0)

@@ -91,6 +91,48 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+#TODO: add cross attention between images and panoptic masks
+class CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.q_proj = nn.Linear(dim, dim , bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, dim , bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim , bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, y):
+        B, L, C = x.shape
+
+        q = self.q_proj(x)
+        k = self.k_proj(y)
+        v = self.v_proj(y)
+
+        q = einops.rearrange(q, 'B L ( H D) -> B H L D', H=self.num_heads)
+        k = einops.rearrange(k, 'B L ( H D) -> B H L D', H=self.num_heads)
+        v = einops.rearrange(v, 'B L ( H D) -> B H L D', H=self.num_heads)
+        if ATTENTION_MODE == 'flash':
+            x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            x = einops.rearrange(x, 'B H L D -> B L (H D)')
+        elif ATTENTION_MODE == 'xformers':
+            x = xformers.ops.memory_efficient_attention(q, k, v)
+            x = einops.rearrange(x, 'B L H D -> B L (H D)', H=self.num_heads)
+        elif ATTENTION_MODE == 'math':
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, L, C)
+        else:
+            raise NotImplemented
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
 
 class Block(nn.Module):
 
@@ -100,9 +142,14 @@ class Block(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale)
+        
+        mlp_hidden_dim = int(dim * mlp_ratio)
         #TODO: add an image self attention without mask, set enable_panoptic to True
         self.enable_panoptic=enable_panoptic
         if enable_panoptic==True:
+            #TODO: Try cross attention for each other
+            #self.attn_image = CrossAttention(
+            #    dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale)
             self.attn_image = Attention(
                 dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale)
             self.norm_image= norm_layer(dim)
@@ -110,45 +157,63 @@ class Block(nn.Module):
             self.attn_mask = Attention(
                 dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale)
             self.norm_mask= norm_layer(dim)
+            #self.mlp_mask = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)
+            #self.norm2_mask = norm_layer(dim)
         self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)
         self.skip_linear = nn.Linear(2 * dim, dim) if skip else None
         self.use_checkpoint = use_checkpoint
 
-    def forward(self, x, skip=None, extra_dims=0):
+    def forward(self, x, skip=None, extra_dims=0, use_ground_truth=False, enable_panoptic=False):
         if self.use_checkpoint:
-            return torch.utils.checkpoint.checkpoint(self._forward, x, skip, extra_dims)
+            return torch.utils.checkpoint.checkpoint(self._forward, x, skip, extra_dims, use_ground_truth=use_ground_truth,enable_panoptic=enable_panoptic)
         else:
-            return self._forward(x, skip)
+            return self._forward(x, skip,use_ground_truth=use_ground_truth,enable_panoptic=enable_panoptic)
 
-    def _forward(self, x, skip=None, extra_dims=0):
+    def _forward(self, x, skip=None, extra_dims=0, use_ground_truth=False, enable_panoptic=False):
         if self.skip_linear is not None:
             x = self.skip_linear(torch.cat([x, skip], dim=-1))
+
         x = x + self.attn(self.norm1(x))
         #TODO: separate image/panoptic segmentation mask attention
-        if self.enable_panoptic:
+        if enable_panoptic and use_ground_truth: #only activate extra attn blocks for phase two 
             B, L, D = x.shape
-            len_image= extra_dims+ (L- extra_dims)//2 
+            len_image= extra_dims+ (L- extra_dims)//2             
             
-            '''
-            #TODO:ry add extra feauture (text/time embedding) to masks
-            norm_x=self.norm_image(x)
-            extra_feat= norm_x[:,:extra_dims,:]
-            image_attn= self.attn_image( norm_x[:,:len_image,:])
-            mask_tensor= norm_x[:,len_image:,:]
-            mask_attn= self.attn_mask( torch.cat((extra_feat,mask_tensor), dim=1))
+            #TODO:try add extra feauture (text/time embedding) to masks
+            extra_feat= x[:,:extra_dims,:]
+            mask_tensor= x[:,len_image:,:]
+            image_norm =self.norm_image(x[:,:len_image,:])
+            mask_norm= self.norm_mask( torch.cat((extra_feat,mask_tensor), dim=1))
+            #TODO: try cross-attention between image and mask
+            #image_attn= self.attn_image( image_norm, mask_norm)
+            #Use self attention for image
+            image_attn= self.attn_image( image_norm)
+            mask_attn= self.attn_mask( mask_norm)
+            #mask_attn= self.attn_mask(  self.norm_mask( torch.cat((extra_feat,mask_tensor), dim=1)))
+
+            #TODO: separate MLP for panoptic masks and images
+            #image_attn =  self.mlp(self.norm2(image_attn))
+            #mask_attn =  self.mlp_mask(self.norm2_mask(mask_attn))
+
+            #average of extra feature outputs from both networks
+            extra_attn= (image_attn[:,:extra_dims,:]+mask_attn[:,:extra_dims,:])/2.0
+
+            all_attn= torch.cat((extra_attn, image_attn[:,extra_dims:,:],mask_attn[:,extra_dims:,:]), dim=1)
             '''
 
             mask_tensor= x[:,len_image:,:]
             image_attn= self.attn_image( self.norm_image(x[:,:len_image,:]))
             mask_attn= self.attn_mask( self.norm_mask(mask_tensor))
-            #zero_tensor= torch.zeros(B, L-len_image, D, device=image_attn.device)
             all_attn= torch.cat((image_attn,mask_attn), dim=1)
-            #residual connection
-            x = x + all_attn
+            '''
 
-        x = x + self.mlp(self.norm2(x))
+            #residual connection
+            #x = x + all_attn
+
+            x = x + self.mlp(self.norm2(all_attn))
+        else:
+            x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -173,10 +238,11 @@ class PatchEmbed(nn.Module):
 class UViT(nn.Module): #TODO: set the flags!!!
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.,
                  qkv_bias=False, qk_scale=None, norm_layer=nn.LayerNorm, mlp_time_embed=False, use_checkpoint=False,
-                 clip_dim=768, num_clip_token=77, conv=True, skip=True, num_panoptic_class=201, enable_panoptic=True, use_ground_truth=True):
+                 clip_dim=768, num_clip_token=77, conv=True, skip=True, num_panoptic_class=8, enable_panoptic=True, use_ground_truth=False):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.in_chans = in_chans
+        self.enable_panoptic=enable_panoptic
 
         self.patch_embed = PatchEmbed(patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = (img_size // patch_size) ** 2
@@ -215,10 +281,11 @@ class UViT(nn.Module): #TODO: set the flags!!!
         self.final_layer = nn.Conv2d(self.in_chans, self.in_chans, 3, padding=1) if conv else nn.Identity()
 
         #TODO:add layers for panoptic segmentation masks
-        self.mask_embed=PatchEmbed(patch_size=patch_size, in_chans=1, embed_dim=embed_dim) #map category id to embed dim
+        #use analog bits, 8 bits for 200 classes
+        self.mask_embed=PatchEmbed(patch_size=patch_size, in_chans=8, embed_dim=embed_dim) #map category id to embed dim
         self.decoder_pred_mask = nn.Linear(embed_dim, self.patch_dim, bias=True)
         
-        #NOTE: predict category ids and then use cross entropy loss
+        #NOTE: predict category ids and then use cross entropy loss #set num_panoptic_class to 8 for analog bits
         self.final_layer_mask =nn.Conv2d(self.in_chans, num_panoptic_class,3, padding=1) if conv else nn.Identity()
         #NOTE: set to true if input ground truth mask
         self.use_ground_truth=use_ground_truth
@@ -239,7 +306,10 @@ class UViT(nn.Module): #TODO: set the flags!!!
     def no_weight_decay(self):
         return {'pos_embed'}
 
-    def forward(self, x, timesteps, context, mask_token=None):
+    def forward(self, x, timesteps, context, mask_token=None, use_ground_truth=False, enable_panoptic=False):
+        #NOTE: activate/deactivate this when calling the forward pass of the model
+        self.use_ground_truth=use_ground_truth
+        
         x = self.patch_embed(x)
         B, L, D = x.shape
 
@@ -254,16 +324,17 @@ class UViT(nn.Module): #TODO: set the flags!!!
         else:
             x = torch.cat((time_token, context_token, x), dim=1)
             x = x + self.pos_embed[:, :self.extras + L, :]
+            enable_panoptic=False #must be disabled for unconditional ones
 
         skips = []
         for blk in self.in_blocks:
-            x = blk(x, extra_dims=self.extras )
+            x = blk(x, extra_dims=self.extras, use_ground_truth=self.use_ground_truth, enable_panoptic=enable_panoptic )
             skips.append(x)
 
-        x = self.mid_block(x, extra_dims=self.extras )
+        x = self.mid_block(x, extra_dims=self.extras, use_ground_truth=self.use_ground_truth, enable_panoptic=enable_panoptic )
 
         for blk in self.out_blocks:
-            x = blk(x, skips.pop(), extra_dims=self.extras )
+            x = blk(x, skips.pop(), extra_dims=self.extras, use_ground_truth=self.use_ground_truth, enable_panoptic=enable_panoptic )
 
         x = self.norm(x)
         #predict noise, use only x queries, ignore mask queries

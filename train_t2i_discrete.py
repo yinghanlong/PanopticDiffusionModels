@@ -60,6 +60,9 @@ with open(panoptic_coco_categories, 'r') as f:
 categegories = {category['id']: category for category in categories_list}
 color_generator=IdGenerator(categegories)
 
+#TODO: Set the flag to True to input ground truth panoptic mask to the model
+use_ground_truth=False
+use_twophases=False
 class Schedule(object):  # discrete time
     def __init__(self, _betas):
         r""" _betas[0...999] = betas[1...1000]
@@ -87,7 +90,16 @@ class Schedule(object):  # discrete time
     def tilde_beta(self, s, t):
         return self.skip_betas[s, t] * self.cum_betas[s] / self.cum_betas[t]
 
-    def sample(self, x0, panoptic=None):  # sample from q(xn|x0), where n is uniform
+    def sample(self, x0, panoptic=None, phaseone=True):  # sample from q(xn|x0), where n is uniform
+        #TODO: for phase one, generate n in (2/N,N], for phase two, generate rand n in [1,2/N]
+        '''
+        if use_twophases==True:
+            if phaseone==True:
+                n = np.random.choice(list(range(self.N//2 + 1, self.N + 1)), (len(x0),)) 
+            else: #phase two
+                n = np.random.choice(list(range(1, self.N//2 + 1)), (len(x0),)) 
+        else:
+        '''
         n = np.random.choice(list(range(1, self.N + 1)), (len(x0),)) #random step
         eps = torch.randn_like(x0) #random noise
         # set to accumulated masked noise
@@ -101,30 +113,50 @@ class Schedule(object):  # discrete time
             return torch.tensor(n, device=x0.device), eps, xn
         else:
             #print('panoptic shape ',panoptic.shape ) #batch, 1, 32,32
+            #if use_twophases==True:
+            #    n= n*2- self.N #double the steps for mask!
+            
             eps_m = torch.randn_like(panoptic) #random noise
             mask_n = stp(self.cum_alphas[n] ** 0.5, panoptic) + stp(self.cum_betas[n] ** 0.5, eps_m)
+            
             return torch.tensor(n, device=x0.device), eps, xn, eps_m, mask_n
 
     def __repr__(self):
         return f'Schedule({self.betas[:10]}..., {self.N})'
 
-#TODO: Set the flag to True to input ground truth panoptic mask to the model
-use_ground_truth=True
+
 def LSimple(x0, nnet, schedule,  loss_func, panoptic=None,**kwargs):
     if panoptic is None:
         n, eps, xn = schedule.sample(x0)  # n in {1, ..., 1000}
         eps_pred, mask_pred = nnet(xn, n, **kwargs) 
     else:
         #scale panoptic to [-1,1]
-        scaled_panoptic = (panoptic/ 100.0 - 1.0) #category id's range is 1-200
+        #scaled_panoptic = (panoptic/ 100.0 - 1.0) #category id's range is 1-200
+        #TODO: analog bits for masks
+        # Discrete masks to analog bits.
+        scaled_panoptic= utils.int2bits(panoptic,out_dtype=torch.float)
+        scaled_panoptic = (scaled_panoptic * 2.0 - 1.0) # * scale =1
         #TODO: use another noise for panoptic segmentation mask
-        n, eps, xn, eps_m, mask_n = schedule.sample(x0, scaled_panoptic)  # n in {1, ..., 1000}
+        n, eps, xn, eps_m, mask_n = schedule.sample(x0, scaled_panoptic, phaseone=True)  # n in {1, ..., 1000}
+        
         #Run the diffusion model to predict noises from image xn and panoptic segmentation mask mask_n 
         #TODO: Jan17: test use ground truth panoptic mask
         if use_ground_truth==True:
-            eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=scaled_panoptic) 
+            eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=scaled_panoptic, use_ground_truth=True, enable_panoptic=True) 
         else:
-            eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=mask_n) 
+            eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=mask_n, use_ground_truth=False, enable_panoptic=True) 
+            ##use initial noises as mask queries
+            ##eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=eps_m) 
+        if use_twophases==True: #TODO:phase two use ground truth panoptic mask 
+            #use same noise as phase one!
+            #n2, eps2, xn2= schedule.sample(x0, phaseone=False)  # n in {1, ..., N/2}
+            #TODO: use mask_pred from phase one
+            mask_label = torch.max(mask_pred, dim=1,keepdim=True)[1].float()
+            #scale mask input to [-1,1]. This is M0. mask_token is M[t]
+            scaled_mask = mask_label/ 100.0 - 1.0 
+            #eps_pred2, mask_pred2 = nnet(xn, n, **kwargs, mask_token=scaled_mask, use_ground_truth=True, enable_panoptic=True) 
+            eps_pred2, mask_pred2 = nnet(xn, n, **kwargs, mask_token=scaled_panoptic, use_ground_truth=True, enable_panoptic=True) 
+            loss_2= mos(eps-eps_pred2)
     #TODO: sum the losses
     loss_eps = mos(eps - eps_pred)
     if panoptic is None:
@@ -137,8 +169,13 @@ def LSimple(x0, nnet, schedule,  loss_func, panoptic=None,**kwargs):
         if use_ground_truth==True:
             loss_mask= loss_eps
         else:
-            loss_mask =  loss_func(mask_pred, panoptic).mean()
-        return loss_eps, loss_mask
+            #TODO: use mse loss for analog bits
+            loss_mask= mos(mask_pred-scaled_panoptic)
+            #loss_mask =  loss_func(mask_pred, panoptic).mean()
+        if use_twophases==True: #average losses of two phases
+            return (loss_eps+loss_2)/2.0, loss_mask
+        else:
+            return loss_eps, loss_mask
 
 
 def train(config):
@@ -218,8 +255,8 @@ def train(config):
     _schedule = Schedule(_betas)
     logging.info(f'use {_schedule}')
 
-    def cfg_nnet(x, timesteps, context, mask_token=None):
-        _cond, pred_mask = nnet_ema(x, timesteps, context=context, mask_token=mask_token)
+    def cfg_nnet(x, timesteps, context, mask_token=None, use_ground_truth=False, enable_panoptic=False):
+        _cond, pred_mask = nnet_ema(x, timesteps, context=context, mask_token=mask_token,use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
         _empty_context = torch.tensor(dataset.empty_context, device=device)
         _empty_context = einops.repeat(_empty_context, 'L D -> B L D', B=x.size(0))
         _uncond = nnet_ema(x, timesteps, context=_empty_context)
@@ -235,6 +272,8 @@ def train(config):
         #mask_token = torch.zeros_like(_z,device=_z.device)
         if use_panoptic==True:
             loss_eps, loss_mask= LSimple(_z, nnet, _schedule,  loss_func=loss_cross_entropy,panoptic=_batch[2],context=_batch[1])  # currently only support the extracted feature version
+            #if config.use_twophases==True:
+            #    loss_eps, loss_mask, loss_2= LSimple(_z, nnet, _schedule,  loss_func=loss_cross_entropy,panoptic=_batch[2],context=_batch[1])  
         else:
             loss_eps= LSimple(_z, nnet, _schedule,  panoptic=None, context=_batch[1])  # currently only support the extracted feature version
       
@@ -257,26 +296,30 @@ def train(config):
         #TODO: modify sampling to add panoptic mask
         #add a input panoptic 
         _z_init = torch.randn(_n_samples, *config.z_shape, device=device)
-        #TODO: Jan17 use ground truth mask
+
+        scaled_panoptic= utils.int2bits(panoptic).astype(float)
+        scaled_panoptic = (scaled_panoptic * 2.0 - 1.0)
+        #TODO: use ground truth mask
         if use_ground_truth==True:
             scaled_panoptic= (panoptic/ 100.0 - 1.0)
             mask_token =  scaled_panoptic
         else:
             #initial as random
-            mask_token = torch.randn(*panoptic.shape, device=device)
+            mask_token = torch.randn(*scaled_panoptic.shape, device=device)
+        
         #print('panoptic shape ',panoptic.shape )
         #if panoptic is not None:
         #    _z_init = _z_init* panoptic
         
         noise_schedule = NoiseScheduleVP(schedule='discrete', betas=torch.tensor(_betas, device=device).float())
 
-        def model_fn(x, t_continuous, panoptic=None, mask_token=None):
+        def model_fn(x, t_continuous, panoptic=None, mask_token=None, use_ground_truth=False, enable_panoptic=False):
             #Note: panoptic is the ground-truth mask. It is not used in DPM solver!
             t = t_continuous * _schedule.N
             if mask_token is None:
                 return cfg_nnet(x, t, **kwargs)
-            else:
-                return cfg_nnet(x, t, mask_token=mask_token, **kwargs)
+            else: #the arguments are enabled in dpm_solver_pp.py
+                return cfg_nnet(x, t, mask_token=mask_token, use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic, **kwargs)
                 #TODO: try division in the backward process
                 #return panoptic * cfg_nnet(x, t, **kwargs)
                 #return torch.div( cfg_nnet(x, t, **kwargs), panoptic+1.0e-6)
@@ -285,7 +328,7 @@ def train(config):
         solver_order=1
         #TODO: try first order solver, set order=1
         if solver_order==1:
-            _z, pred_mask = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=1, panoptic=panoptic, method='singlestep', mask_token=mask_token)
+            _z, pred_mask = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=1, panoptic=panoptic, method='singlestep', mask_token=mask_token, use_twophases=use_twophases)
         else:
             _z = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=3, panoptic=panoptic, mask_token=mask_token)
         #TODO: show predicted mask, evaluate the loss with panoptic
@@ -294,14 +337,15 @@ def train(config):
             if use_ground_truth==True:
                 loss_mean=1.0
             else:
-                loss_mask = loss_func(pred_mask, panoptic.squeeze(1).type(torch.long)).mean()
-                ##loss_mask =  mos(panoptic- pred_mask)
+                ##loss_mask = loss_func(pred_mask, panoptic.squeeze(1).type(torch.long)).mean()
+                #TODO: use mos loss for analog bits
+                loss_mask =  mos(scaled_panoptic- pred_mask)
                 loss_mean = accelerator.gather(loss_mask.detach()).mean()
             #pred_mask = make_grid(pred_mask, 8)
             #save_image(samples, os.path.join(config.sample_dir, f'{train_state.step}.png'))
             #wandb.log({'pred_mask': wandb.Image(pred_mask)}, step=train_state.step)
 
-            return decode(_z), pred_mask, loss_mean
+            return decode(_z), pred_mask, loss_mean, panoptic
         else:
             return decode(_z)
 
@@ -454,7 +498,7 @@ def get_hparams():
     if hparams == '':
         from datetime import datetime
         date= datetime.now().strftime('%Y-%m-%d-%H-%M')
-        hparams = 'coco2017-1-ground-truth-separate-attn-merge'#+date
+        hparams = 'coco2017-1-analog-bits-mse'#+date
         #hparams = 'coco2017-1-ground-truth-merge'
     return hparams
 
@@ -467,6 +511,7 @@ def main(argv):
     config.ckpt_root = os.path.join(config.workdir, 'ckpts')
     config.sample_dir = os.path.join(config.workdir, 'samples')
     config.evaluation_only = FLAGS.evaluation_only
+
     if config.evaluation_only:
         print("!!!!evaluation only!!!!!")
     train(config)

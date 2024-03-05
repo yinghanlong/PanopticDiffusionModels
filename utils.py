@@ -177,6 +177,35 @@ def category2rgb(color_generator,id_map, categegories):
         
     return rgb_map
 
+#NOTE: analog bits for generating panoptic segmentation masks from bit diffusion paper
+#TODO: rewrite with pytorch
+def int2bits(x, n=8, out_dtype=None):
+  """Convert an integer x in (b,1,h,w) into bits in (b,n,h,w)."""
+  #print(x.shape, x[0,:,0,0])
+  x=x.type(torch.int)
+  y=x.clone()
+  for i in range(1,n):
+      y = torch.cat((torch.bitwise_right_shift(x, i), y), dim=1)
+  #print('int2bits:',y.shape, y[0,:,0,0])
+  y = torch.remainder(y, 2)
+  #print('mod by 2:',y.shape, y[0,:,0,0])
+  if out_dtype and out_dtype != y.dtype:
+    y = y.type(out_dtype)
+  return y
+
+def bits2int(x, out_dtype):
+  """Converts bits x in (b,n,h,w) into an integer in (b,1,h,w)."""
+  x = x.type(out_dtype)
+  y = torch.zeros(x.shape[0],x.shape[2],x.shape[3])
+  for i in range(n):
+    y += x[:,i,:,:] * (2 ** i)
+ 
+  #x = torch.sum(x * (2 ** torch.range(start=0,end=x.shape[1])), 1, keepdim=True)
+  return y.unsqueeze(1)
+
+colormap= torch.randint(0,255,(256,3))
+def color_map(x):
+    return colormap[x]
 def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unpreprocess_fn=None, step=None, use_panoptic=False):
     os.makedirs(path, exist_ok=True)
     idx = 0
@@ -193,7 +222,7 @@ def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unprepr
         if use_panoptic==False:
             samples = sample_fn(mini_batch_size, use_panoptic=False)
         else:
-            samples, pred_mask, loss_mask = sample_fn(mini_batch_size,use_panoptic=True)
+            samples, pred_mask, loss_mask, panoptic = sample_fn(mini_batch_size,use_panoptic=True)
             #TODO:accumulate loss
             loss_mask_all.append(loss_mask)
             pred_mask = accelerator.gather(pred_mask.contiguous())[:_batch_size]
@@ -203,11 +232,16 @@ def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unprepr
             if idx==0 and (step is not None) and use_panoptic==True: #visualize in wandb
                 grid_samples = make_grid(samples, 8)
                 wandb.log({'eval_samples': wandb.Image(grid_samples)}, step)
-                mask_max, mask_label = torch.max(pred_mask,dim=1, keepdim=True)#indices
                 #color_mask = torch.zeros_like(pred_mask)
                 #for i in range(mask_label.shape[0]):
                 #    color_mask[i,...] = category2rgb(color_generator,mask_label[i,...],categegories)
+                #TODO: convert analog bits back to integer
+                pre_mask= utils.bits2int(pre_mask>0, torch.int) #this convert pred_mask to [N,1,H,W]
+                color_masks= color_map(pred_mask)
+                grid_mask = make_grid(color_masks.float() , 5, normalize=True) 
+                '''
                 #TODO: print colored maps
+                mask_max, mask_label = torch.max(pred_mask,dim=1, keepdim=True)#indices
                 color_masks = torch.zeros_like(pred_mask, dtype=bool) #[b,200,h,w]
                 color_masks[pred_mask==mask_max] = 1
                 empty_image = torch.zeros(pred_mask.shape[0],3,32,32, dtype=torch.uint8)
@@ -215,13 +249,17 @@ def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unprepr
                     logging.info(f'Color masks...{i}')
                     empty_image[i,:,:,:]= draw_segmentation_masks(empty_image[i,:,:,:], color_masks[i,:,:,:],alpha=0.7)   
                 grid_mask = make_grid(empty_image.float() , 5, normalize=True) 
+                '''
                 #grid_mask = make_grid(mask_label.float(), 8, normalize=True)
                 wandb.log({'pred_mask': wandb.Image(grid_mask)}, step)
+                color_panoptic= color_map(panoptic)
+                ground_mask = make_grid(color_panoptic.float(), 8, normalize=True)
+                wandb.log({'ground_truth_mask': wandb.Image(ground_mask)}, step)
             for sample in samples:
                 save_image(sample, os.path.join(path, f"{idx}.png"))
                 idx += 1
-    #if use_panoptic==True and (step is not None):
-    #    wandb.log({f'eval_loss_mask': torch.mean(torch.stack(loss_mask_all))}, step)
+    if use_panoptic==True and (step is not None):
+        wandb.log({f'eval_loss_mask': torch.mean(torch.stack(loss_mask_all))}, step)
 
 
 def grad_norm(model):

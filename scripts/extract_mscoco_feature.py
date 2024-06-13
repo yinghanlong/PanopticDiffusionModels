@@ -8,9 +8,10 @@ import libs.clip
 from datasets import MSCOCODatabase
 import argparse
 from tqdm import tqdm
+import json
 
-
-def main(resolution=256):
+#TODO: change the resolution from 256 to 512 to generate 64x64 latents
+def main(resolution=512):
     parser = argparse.ArgumentParser()
     parser.add_argument('--split', default='train')
     args = parser.parse_args()
@@ -30,7 +31,7 @@ def main(resolution=256):
     else:
         raise NotImplementedError("ERROR!")
 
-    device = "cuda"
+    device = "cuda:0"
     #os.makedirs(save_dir)
     use_category_id = True
 
@@ -43,7 +44,10 @@ def main(resolution=256):
     with torch.no_grad():
         for idx, data in tqdm(enumerate(datas)):
             x, captions, segmentation = data
-            '''
+
+            #print('save captions')
+            np.savetxt(os.path.join(save_dir, f'{idx}_text.txt'), captions, delimiter=" ", fmt="%s") 
+            
             if len(x.shape) == 3:
                 x = x[None, ...]
             x = torch.tensor(x, device=device)
@@ -55,9 +59,9 @@ def main(resolution=256):
             for i in range(len(latent)):
                 c = latent[i].detach().cpu().numpy()
                 np.save(os.path.join(save_dir, f'{idx}_{i}.npy'), c)
-            '''
+            
             #TODO: save panoptic annotation
-            print("save annotion,", idx)
+            #print("save annotion,", idx)
             if use_category_id==True:
                 np.save(os.path.join(save_dir, f'{idx}_seg.npy'), segmentation)
             else:
@@ -67,5 +71,6 @@ def main(resolution=256):
                 encode_maps = autoencoder(segmentation, fn='encode_moments').squeeze(0)
                 encode_maps = encode_maps.detach().cpu().numpy()
                 np.save(os.path.join(save_dir, f'{idx}_encode_p.npy'), encode_maps)
+            
 if __name__ == '__main__':
     main()

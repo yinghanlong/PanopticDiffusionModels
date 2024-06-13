@@ -2,6 +2,8 @@ ssh long273@cbric-gpu15.ecn.purdue.edu
 cd Documents
 source myenv/bin/activate
 cd diffusers/U-ViT
+
+python -m clip_score /home/nano01/a/long273/results/mscoco_uvit_mid/coco2017-3-analogbit-mid/samples /home/nano01/a/long273/coco256_features/val2017 --device cuda:1
 CUDA_VISIBLE_DEVICES=3
 # CIFAR10 (U-ViT-S/2)
 accelerate launch --multi_gpu --num_processes 4 --mixed_precision fp16 train.py --config=configs/cifar10_uvit_small.py
@@ -28,7 +30,7 @@ accelerate launch --multi_gpu --num_processes 8 --mixed_precision fp16 train_ldm
 accelerate launch --multi_gpu --num_processes 8 --mixed_precision fp16 train_ldm_discrete.py --config=configs/imagenet512_uvit_huge.py
 
 # MS-COCO (U-ViT-S/2)
-accelerate launch --multi_gpu --num_processes 2 --mixed_precision fp16 train_t2i_discrete.py --config=configs/mscoco_uvit_small.py
+accelerate launch --multi_gpu --num_processes 2 --mixed_precision fp16 train_t2i_discrete.py --config=configs/mscoco_uvit_mid.py
 accelerate launch  --num_processes 1 --mixed_precision fp16 train_t2i_discrete.py --config=configs/mscoco_uvit_small.py
 
 # MS-COCO (U-ViT-S/2, Deep)

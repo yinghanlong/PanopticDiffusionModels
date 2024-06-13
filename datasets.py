@@ -504,13 +504,18 @@ class MSCOCODatabase(Dataset):
             Image.open(os.path.join(self.segment_folder, p_ann['file_name'])),
             dtype=np.uint8
         )
+        seg_masks= np.zeros_like(segmentation)
         segmentation_id = rgb2id(segmentation)
         #set pixel values to category ids
         if self.use_category_id==True:
             for segment_info in p_ann['segments_info']:
                 color = segment_info['category_id']
                 mask = segmentation_id == segment_info['id']                
-                segmentation[mask] = color
+                #segmentation[mask] = color
+                #Use a zero-initialized image to avoid undefined values at the boundary
+                seg_masks[mask]=color 
+            #set segmentation to masks
+            segmentation = seg_masks
         
         #use raw values of segmentation
         segmentation = np.array(segmentation).astype(np.uint8)
@@ -556,6 +561,7 @@ class MSCOCOFeatureDataset(Dataset):
         z = np.load(os.path.join(self.root, f'{index}.npy'))
         k = random.randint(0, self.n_captions[index] - 1)
         c = np.load(os.path.join(self.root, f'{index}_{k}.npy'))
+        #text = np.loadtxt(os.path.join(self.root, f'{index}_text.txt'))
 
         #TODO: load panoptic segmentation info
         if self.use_category_id == True:
@@ -563,13 +569,13 @@ class MSCOCOFeatureDataset(Dataset):
             s = np.load(os.path.join(self.root, f'{index}_seg.npy'))
             #use scaled id
             #s = np.load(os.path.join(self.root, f'{index}_p.npy'))
-            #pool from size (3,256,256) to (1,32,32)
+            #pool from size (3,256,256) to (1,32,32) or 64,64
             s = skimage.measure.block_reduce(s, (3,8,8), np.min)
         else: #use encoded panoptic map
             s = np.load(os.path.join(self.root, f'{index}_encode_p.npy'))
 
         assert s.shape[-1]==z.shape[-1], f'{s.shape}, {z.shape}'
-        return z, c, s
+        return z, c, s, index #text
 
 
 class MSCOCO256Features(DatasetFactory):  # the moments calculated by Stable Diffusion image encoder & the contexts calculated by clip

@@ -10,7 +10,6 @@ def get_config():
     config = ml_collections.ConfigDict()
 
     config.seed = 1234
-    #Set latent size
     config.z_shape = (4, 32, 32)
 
     config.autoencoder = d(
@@ -20,7 +19,7 @@ def get_config():
 
     config.train = d(
         n_steps=1000000,#1000000
-        batch_size= 64, #128,#256
+        batch_size= 32,#64, #128,#256
         log_interval=10,
         eval_interval=5000,
         save_interval=50000,
@@ -28,7 +27,7 @@ def get_config():
 
     config.optimizer = d(
         name='adamw',
-        lr=0.0001,#lr=0.0002,
+        lr=0.0002,
         weight_decay=0.03,
         betas=(0.9, 0.9),
     )
@@ -43,20 +42,19 @@ def get_config():
         img_size=32,
         in_chans=4,
         patch_size=2,
-        embed_dim=512,
-        depth=12,
-        num_heads=8,
+        embed_dim=768,
+        depth=16,
+        num_heads=12,
         mlp_ratio=4,
         qkv_bias=False,
         mlp_time_embed=False,
         clip_dim=768,
-        num_clip_token=77,
-        enable_panoptic=True, use_ground_truth=False, separate=True
+        num_clip_token=77
     )
 
     config.dataset = d(
         name='mscoco256_features',
-        path='/home/nano01/a/long273/coco256_features', #resolution=256 / 512
+        path='/home/nano01/a/long273/coco256_features',
         cfg=True,
         p_uncond=0.1
     )
@@ -64,7 +62,7 @@ def get_config():
     config.sample = d(
         sample_steps=50,
         n_samples=30000,
-        mini_batch_size= 32,
+        mini_batch_size= 16, #32,
         cfg=True,
         scale=1.,
         path='/home/nano01/a/long273/results/sample'

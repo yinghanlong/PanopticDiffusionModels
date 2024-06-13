@@ -258,3 +258,15 @@ def calculate_fid_given_paths(paths, device=None, batch_size=50, dims=2048, num_
     fid_value = calculate_frechet_distance(m1, s1, m2, s2)
 
     return fid_value
+
+from torchmetrics.functional.multimodal import clip_score
+from functools import partial
+
+clip_score_fn = partial(clip_score, model_name_or_path="openai/clip-vit-base-patch16")
+
+def calculate_clip_score(images, prompts):
+    images_int = (images * 255).astype("uint8")
+    clip_score = clip_score_fn(torch.from_numpy(images_int).permute(0, 3, 1, 2), prompts).detach()
+    return round(float(clip_score), 4)
+
+#sd_clip_score = calculate_clip_score(images, prompts)

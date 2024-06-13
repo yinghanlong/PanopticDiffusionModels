@@ -9,8 +9,8 @@ def d(**kwargs):
 def get_config():
     config = ml_collections.ConfigDict()
 
+    #TODO: change latent z shape to 64,64
     config.seed = 1234
-    #Set latent size
     config.z_shape = (4, 32, 32)
 
     config.autoencoder = d(
@@ -28,7 +28,7 @@ def get_config():
 
     config.optimizer = d(
         name='adamw',
-        lr=0.0001,#lr=0.0002,
+        lr=0.0002,
         weight_decay=0.03,
         betas=(0.9, 0.9),
     )
@@ -43,20 +43,19 @@ def get_config():
         img_size=32,
         in_chans=4,
         patch_size=2,
-        embed_dim=512,
-        depth=12,
-        num_heads=8,
+        embed_dim=1024,
+        depth=20,
+        num_heads=16,
         mlp_ratio=4,
         qkv_bias=False,
         mlp_time_embed=False,
         clip_dim=768,
-        num_clip_token=77,
-        enable_panoptic=True, use_ground_truth=False, separate=True
+        num_clip_token=77
     )
 
     config.dataset = d(
         name='mscoco256_features',
-        path='/home/nano01/a/long273/coco256_features', #resolution=256 / 512
+        path='/home/nano01/a/long273/coco256_features',
         cfg=True,
         p_uncond=0.1
     )

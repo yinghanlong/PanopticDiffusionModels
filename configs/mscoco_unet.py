@@ -15,12 +15,13 @@ def get_config():
 
     config.autoencoder = d(
         pretrained_path='assets/stable-diffusion/autoencoder_kl.pth',
-        scale_factor=0.23010
+        #scale_factor=0.23010 
+        scale_factor=0.18215
     )
 
     config.train = d(
         n_steps=1000000,#1000000
-        batch_size= 64, #128,#256
+        batch_size= 8, #64, #128,#256
         log_interval=10,
         eval_interval=5000,
         save_interval=50000,
@@ -28,7 +29,7 @@ def get_config():
 
     config.optimizer = d(
         name='adamw',
-        lr=0.0001,#lr=0.0002,
+        lr=0.00002,#lr=0.0002,
         weight_decay=0.03,
         betas=(0.9, 0.9),
     )
@@ -51,25 +52,23 @@ def get_config():
         mlp_time_embed=False,
         clip_dim=768,
         num_clip_token=77,
-        enable_panoptic=True, use_ground_truth=False, separate=True, num_panoptic_class=32 #8 or 32
+        enable_panoptic=True, use_ground_truth=False, separate=True
     )
 
     config.dataset = d(
         name='mscoco256_features',
         path='/home/nano01/a/long273/coco256_features', #resolution=256 / 512
-        cfg= True,
-        p_uncond= 0.1
+        cfg=True,
+        p_uncond=0.1
     )
 
     config.sample = d(
         sample_steps=50,
         n_samples=30000,
-        mini_batch_size= 32,
+        mini_batch_size= 4,#32,
         cfg=True,
         scale=1.,
         path='/home/nano01/a/long273/results/sample'
     )
-    #config.use_twophases=True
-    config.use_unet=False
-    config.mask_channel=4 #1 by default
+    config.use_unet=True
     return config

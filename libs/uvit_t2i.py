@@ -247,8 +247,13 @@ class zeroconv(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
         self.conv=nn.Conv1d(embed_dim, embed_dim, 1, padding=0)
+        #self.act = nn.GELU()
+        #self.bn = nn.BatchNorm1d(embed_dim)
+
     def forward(self, x):
+        #x= self.bn(x.transpose(1,2))
         x= self.conv(x.transpose(1,2))
+        #x= self.act(x)
         return x.transpose(1,2)
 class UViT(nn.Module): #TODO: set the flags!!!
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.,
@@ -328,11 +333,14 @@ class UViT(nn.Module): #TODO: set the flags!!!
         #TODO:add layers for panoptic segmentation masks
         #use analog bits, 8 bits for 200 classes
         if enable_panoptic==True:
-            self.mask_embed=PatchEmbed(patch_size=patch_size, in_chans=8, embed_dim=embed_dim) #map category id to embed dim
-            self.decoder_pred_mask = nn.Linear(embed_dim, self.patch_dim, bias=True)
+            #NOTE: use 2 times patch size for masks
+            self.mask_embed=PatchEmbed(patch_size=patch_size, in_chans=num_panoptic_class, embed_dim=embed_dim) #map category id to embed dim
+            patch_dim_mask = patch_size ** 2 * num_panoptic_class
+            self.decoder_pred_mask = nn.Linear(embed_dim, patch_dim_mask, bias=True)
         
             #NOTE: predict category ids and then use cross entropy loss #set num_panoptic_class to 8 for analog bits
-            self.final_layer_mask =nn.Conv2d(self.in_chans, num_panoptic_class,3, padding=1) if conv else nn.Identity()
+            self.num_panoptic_class = num_panoptic_class
+            self.final_layer_mask =nn.Conv2d(num_panoptic_class, num_panoptic_class,3, padding=1) if conv else nn.Identity()
         #NOTE: set to true if input ground truth mask
         self.use_ground_truth=use_ground_truth
 
@@ -395,49 +403,52 @@ class UViT(nn.Module): #TODO: set the flags!!!
         layer_i=0
         x_add=None
         #concat at the first layer
-        if mask_token is not None:
-            mx= torch.cat((x,m), dim=1) 
+        #if mask_token is not None:
+        #    mx= torch.cat((x,m), dim=1) 
         for blk in self.in_blocks:
-            #if self.separate==True and mask_token is not None: #input zero conv layer
+            if self.separate==True and mask_token is not None: #input zero conv layer
                 #if x_add is None:
                 #    x_add = x
                 #else:
                 #    x_add = x + x_add
                 #mx= torch.cat((x,self.zero_convs[2*layer_i](m)), dim=1) #concat
-                #mx= torch.cat((x_add,m), dim=1) #concat
+                mx= torch.cat((x,m), dim=1) #concat
             x = blk(x, extra_dims=self.extras, use_ground_truth=self.use_ground_truth, enable_panoptic=enable_panoptic )
             if self.separate==True and mask_token is not None:
                 mx = self.in_blocks_mask[layer_i](mx, extra_dims=self.extras, use_ground_truth=self.use_ground_truth, enable_panoptic=enable_panoptic )
+                
                 #split m and x
                 x_add=mx[:, :self.extras + L, :]
                 m=mx[:, self.extras + L:, :]
                 #output zero conv layer
                 x_add = self.zero_convs[2*layer_i+1](x_add)
-                #x = x + x_add
+                x = x + x_add
                 skips_mask.append(mx)
             skips.append(x)
             layer_i+=1
 
         if self.separate==True and mask_token is not None: #input zero conv layer
-                #mx= torch.cat((x,self.zero_convs[2*layer_i](m)), dim=1) #concat
-                mx= mx#torch.cat((x_add,m), dim=1) #concat
+            #mx= torch.cat((x,self.zero_convs[2*layer_i](m)), dim=1) #concat
+            mx= torch.cat((x,m), dim=1) #concat
         x = self.mid_block(x, extra_dims=self.extras, use_ground_truth=self.use_ground_truth, enable_panoptic=enable_panoptic )
         if self.separate==True and mask_token is not None:
             mx = self.mid_block_mask(mx, extra_dims=self.extras, use_ground_truth=self.use_ground_truth, enable_panoptic=enable_panoptic )
+            
             #split m and x
             x_add=mx[:, :self.extras + L, :]
             m=mx[:, self.extras + L:, :]
             #output zero conv layer
             x_add = self.zero_convs[2*layer_i+1](x_add)
-            #x = x + x_add
+            x = x + x_add
             layer_i+=1
 
         for blk in self.out_blocks:
             if self.separate==True and mask_token is not None: #input zero conv layer
                 #mx= torch.cat((x,self.zero_convs[2*layer_i](m)), dim=1) #concat
-                mx= mx #torch.cat((x_add,m), dim=1) #concat
+                mx=torch.cat((x,m), dim=1) #concat
             x = blk(x, skips.pop(), extra_dims=self.extras, use_ground_truth=self.use_ground_truth, enable_panoptic=enable_panoptic )
-            if self.separate==True and mask_token is not None:
+            #TODO: test only use half of decoder layers for mask
+            if self.separate==True and mask_token is not None:# and (layer_i< self.depth*3//4):
                 mx = self.out_blocks_mask[layer_i-1-self.depth//2](mx, skips_mask.pop(), extra_dims=self.extras, use_ground_truth=self.use_ground_truth, enable_panoptic=enable_panoptic )
                 #mx = self.out_blocks_mask[layer_i-1-self.depth//2](mx, extra_dims=self.extras, use_ground_truth=self.use_ground_truth, enable_panoptic=enable_panoptic )
                 
@@ -462,8 +473,11 @@ class UViT(nn.Module): #TODO: set the flags!!!
         if mask_token is not None:
             #TODO: Jan17 use ground truth mask, do not predict it
             if self.use_ground_truth==True:
-                mask_feature=x[:, self.extras+L:, :]
                 image_feature=x[:, self.extras:self.extras + L, :]
+                if self.separate==False:
+                    mask_feature= x[:, self.extras+L:, :]
+                else:
+                    mask_feature= m
                 #merge together
                 image_feature=image_feature+mask_feature
                 noise = self.decoder_pred(image_feature)
@@ -477,7 +491,7 @@ class UViT(nn.Module): #TODO: set the flags!!!
                     #mask2image = self.decoder_mask2image(x[:, self.extras+L:, :])
                     #noise= noise + mask2image
 
-                    y = unpatchify(y, self.in_chans)
+                    y = unpatchify(y, self.num_panoptic_class)#self.in_chans)
                     y = self.final_layer_mask(y)
                 else: 
                     noise = self.decoder_pred(x[:, self.extras:, :])
@@ -485,7 +499,7 @@ class UViT(nn.Module): #TODO: set the flags!!!
                     y = self.decoder_pred_mask(m)
                     #y = self.decoder_pred_mask(m[:, self.extras:, :])
 
-                    y = unpatchify(y, self.in_chans)
+                    y = unpatchify(y, self.num_panoptic_class)#self.in_chans)
                     y = self.final_layer_mask(y)
 
 

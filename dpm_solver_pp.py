@@ -1053,8 +1053,6 @@ class DPM_Solver:
                     x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t,enable_mask_opt=enable_mask_opt, use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
                     #NOTE: ground-truth
                     #x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t,enable_mask_opt=False, use_ground_truth=True, enable_panoptic=True)
-                    #NOTE: use generater mask
-                    #x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t,enable_mask_opt=True, use_ground_truth=False, enable_panoptic=True)
                     #baseline
                     #x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t,enable_mask_opt=False, use_ground_truth=False, enable_panoptic=False)
                     #else: #phase two, disable mask update, use mask_t from phase one

@@ -459,6 +459,14 @@ class FrozenAutoencoderKL(nn.Module):
         else:
             raise NotImplementedError
 
+def DiagonalGaussianDistribution(moments):
+    mean, logvar = torch.chunk(moments, 2, dim=1)
+    logvar = torch.clamp(logvar, -30.0, 20.0)
+    std = torch.exp(0.5 * logvar)
+    scale_factor=0.18215
+    z = mean + std * torch.randn_like(mean)
+    z = scale_factor * z
+    return z
 
 def get_model(pretrained_path, scale_factor=0.18215):
     ddconfig = dict(

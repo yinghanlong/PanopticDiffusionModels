@@ -55,12 +55,28 @@ class CFGDataset(Dataset):  # for classifier free guidance
         load_data = self.dataset[item]
         x = load_data[0]
         y = load_data[1]
-        if random.random() < self.p_uncond:
+        r=random.random()
+        r2=random.random()
+        if r < self.p_uncond:
             y = self.empty_token
         
-        if len(load_data)>2:
+        if len(load_data)==3:
+
+            #Test: Set x to zero. NOTE: x and y can not be zero at the same time
+            #if r>self.p_uncond and r2<self.p_uncond: #0.2*0.8
+            #    x= np.zeros_like(x)
             z = load_data[2]
+            #if r2 < 2*self.p_uncond and r> self.p_uncond: #p=0.2*0.9, NOTE: y and z may not be zero at the same time
+            #if r< self.p_uncond: #unconditional: set mask and context to 0
+            #    z = np.zeros_like(z)
             return x,y,z
+        elif len(load_data)>3:
+            z = load_data[2]
+            #if r2 < 2*self.p_uncond and r> self.p_uncond: #p=0.2*0.9
+            #if r< self.p_uncond: #unconditional: set mask and context to 0
+            #    z = np.zeros_like(z)
+            w = load_data[3]
+            return x,y,z,w
         else:
             return x, y
 
@@ -569,8 +585,24 @@ class MSCOCOFeatureDataset(Dataset):
             s = np.load(os.path.join(self.root, f'{index}_seg.npy'))
             #use scaled id
             #s = np.load(os.path.join(self.root, f'{index}_p.npy'))
-            #pool from size (3,256,256) to (1,32,32) or 64,64
-            s = skimage.measure.block_reduce(s, (3,8,8), np.min)
+            #pool masks from size (3,256,256) to (1,32,32) or 64,64
+            s = skimage.measure.block_reduce(s, (3,4,4), np.min)
+            #TODO: concat (1,64,64) to (4,32,32)
+            
+            s_1 = s[:,::2,::2] 
+            s_2 = s[:,1::2,::2] 
+            s_3 = s[:,::2,1::2] 
+            s_4 = s[:,1::2,1::2] 
+            s = np.concatenate((s_4,s_3,s_2,s_1),axis=0)
+            
+            #NOTE: Set s to zero if min!=max, which means it's at the edge
+            #s_min = skimage.measure.block_reduce(s, (3,8,8), np.min)
+            #s_max = skimage.measure.block_reduce(s, (3,8,8), np.max)
+            #zero_edge= (s_min!= s_max)
+            #s_min[zero_edge] = 0
+            #s= s_min
+            #s= np.concatenate((s_min, s_max))
+            
         else: #use encoded panoptic map
             s = np.load(os.path.join(self.root, f'{index}_encode_p.npy'))
 
@@ -581,9 +613,11 @@ class MSCOCOFeatureDataset(Dataset):
 class MSCOCO256Features(DatasetFactory):  # the moments calculated by Stable Diffusion image encoder & the contexts calculated by clip
     def __init__(self, path, cfg=False, p_uncond=None):
         super().__init__()
-        print('Prepare dataset...')
-        self.train = MSCOCOFeatureDataset(os.path.join(path, 'train2017'))
+        print('Prepare dataset...coco')
+        self.train = MSCOCOFeatureDataset(os.path.join(path, 'train2017')) 
         self.test = MSCOCOFeatureDataset(os.path.join(path, 'val2017'))
+        #self.train = MSCOCOFeatureDataset(os.path.join(path, 'trainSD')) #train2017
+        #self.test = MSCOCOFeatureDataset(os.path.join(path, 'valSD'))#val2017
         
         #assert len(self.train) == 82783
         #assert len(self.test) == 40504
@@ -593,7 +627,7 @@ class MSCOCO256Features(DatasetFactory):  # the moments calculated by Stable Dif
 
         if cfg:  # classifier free guidance
             assert p_uncond is not None
-            print(f'prepare the dataset for classifier free guidance with p_uncond={p_uncond}')
+            print(f'prepare the dataset for MASK classifier free guidance with p_uncond={p_uncond}')
             self.train = CFGDataset(self.train, p_uncond, self.empty_context)
 
         # text embedding extracted by clip

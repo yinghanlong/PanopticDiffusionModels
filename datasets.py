@@ -586,15 +586,16 @@ class MSCOCOFeatureDataset(Dataset):
             #use scaled id
             #s = np.load(os.path.join(self.root, f'{index}_p.npy'))
             #pool masks from size (3,256,256) to (1,32,32) or 64,64
-            s = skimage.measure.block_reduce(s, (3,4,4), np.min)
+            #s = skimage.measure.block_reduce(s, (3,4,4), np.min)
+            s = skimage.measure.block_reduce(s, (3,8,8), np.min)
             #TODO: concat (1,64,64) to (4,32,32)
-            
+            '''
             s_1 = s[:,::2,::2] 
             s_2 = s[:,1::2,::2] 
             s_3 = s[:,::2,1::2] 
             s_4 = s[:,1::2,1::2] 
             s = np.concatenate((s_4,s_3,s_2,s_1),axis=0)
-            
+            '''
             #NOTE: Set s to zero if min!=max, which means it's at the edge
             #s_min = skimage.measure.block_reduce(s, (3,8,8), np.min)
             #s_max = skimage.measure.block_reduce(s, (3,8,8), np.max)
@@ -606,7 +607,7 @@ class MSCOCOFeatureDataset(Dataset):
         else: #use encoded panoptic map
             s = np.load(os.path.join(self.root, f'{index}_encode_p.npy'))
 
-        assert s.shape[-1]==z.shape[-1], f'{s.shape}, {z.shape}'
+        #assert s.shape[-1]==z.shape[-1], f'{s.shape}, {z.shape}'
         return z, c, s, index #text
 
 

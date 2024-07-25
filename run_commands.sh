@@ -2,6 +2,7 @@ ssh long273@cbric-gpu15.ecn.purdue.edu
 cd Documents
 source myenv/bin/activate
 cd diffusers/U-ViT
+source ~/.bashrc
 
 python -m clip_score /home/nano01/a/long273/results/mscoco_uvit_mid/coco2017-3-analogbit-mid/samples /home/nano01/a/long273/coco256_features/val2017 --device cuda:1
 CUDA_VISIBLE_DEVICES=3

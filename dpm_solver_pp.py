@@ -1020,6 +1020,7 @@ class DPM_Solver:
             timesteps = self.get_time_steps(skip_type=skip_type, t_T=t_T, t_0=t_0, N=steps, device=device)
             with torch.no_grad():
                 i = 0
+                pred_mask = mask_token
                 mask_t=mask_token
                 #if mask_t is None:
                 #    print("*****ERROR: mask token is none at beginning")
@@ -1032,7 +1033,7 @@ class DPM_Solver:
                     #if mask_t is None:
                     #    print("*****ERROR: mask t becomes none at order ", i)
                     
-                    x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type, r1=r1, r2=r2, panoptic=panoptic, mask_token=mask_t, enable_mask_opt=enable_mask_opt, use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
+                    x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type, r1=r1, r2=r2, panoptic=pred_mask, mask_token=mask_t, enable_mask_opt=enable_mask_opt, use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
                     #TODO:ground-truth mask with thrid order
                     #x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type, r1=r1, r2=r2, panoptic=panoptic, mask_token=mask_t, enable_mask_opt=False,  use_ground_truth=True, enable_panoptic=True)
                     i += order
@@ -1044,13 +1045,15 @@ class DPM_Solver:
             assert len(timesteps) - 1 == N_steps
             #NOTE:iteratively generate the mask by steps
             mask_t = mask_token
+            pred_mask = mask_token
             with torch.no_grad():
                 for i, order in enumerate(orders):
                     vec_s, vec_t = torch.ones((x.shape[0],)).to(device) * timesteps[i], torch.ones((x.shape[0],)).to(device) * timesteps[i + 1]
                     ##test starting from initial noise as mask queries at every step
                     #x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_token)
                     #if use_twophases==False or i<N_steps/2:#phase one
-                    x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t,enable_mask_opt=enable_mask_opt, use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
+                    #NOTE: input both pred_mask and mask_t 
+                    x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=pred_mask, mask_token=mask_t,enable_mask_opt=enable_mask_opt, use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
                     #NOTE: ground-truth
                     #x, pred_mask, mask_t = self.dpm_solver_update(x, vec_s, vec_t, order, solver_type=solver_type,panoptic=panoptic, mask_token=mask_t,enable_mask_opt=False, use_ground_truth=True, enable_panoptic=True)
                     #baseline

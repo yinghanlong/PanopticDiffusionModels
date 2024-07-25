@@ -22,6 +22,8 @@ from panopticapi.utils import IdGenerator
 import json
 import random
 
+from datetime import datetime
+from datetime import timedelta
 #TODO: use pretrained UNET from stable diffusion 
 from diffusers import UNet2DConditionModel
 from diffusers import AutoencoderKL
@@ -30,6 +32,8 @@ from utils import create_unet_diffusers_config
 from utils import convert_ldm_unet_checkpoint
 from omegaconf import OmegaConf
 from diffusers import PNDMScheduler
+from accelerate import DistributedDataParallelKwargs
+from accelerate import InitProcessGroupKwargs
 global use_unet
 use_unet=False
 
@@ -64,7 +68,7 @@ def mos(a, start_dim=1):  # mean of square
 
 #TODO: global flag to use panoptic info
 use_panoptic = True
-p_uncond = 0. #for mask cfg
+p_uncond = 0.0 #for mask cfg
 cfg_scale = 1.0
 
 panoptic_coco_categories = '../panopticapi-master/panoptic_coco_categories.json'
@@ -129,8 +133,8 @@ class Schedule(object):  # discrete time
             #print('panoptic shape ',panoptic.shape ) #batch, 1, 32,32
             #if use_twophases==True:
             #    n= n*2- self.N #double the steps for mask!
-            
-            eps_m = torch.randn_like(panoptic) #random noise
+            #NOTE: make noise variance larger so it can flip the analog bits of masks
+            eps_m = 2.0 * torch.randn_like(panoptic) #random noise
             #TODO: inspired by SDEdit, reduce the timestep by half for masks to start from a mid point
             #n_mid = n//2
             mask_n = stp(self.cum_alphas[n] ** 0.5, panoptic) + stp(self.cum_betas[n] ** 0.5, eps_m)
@@ -159,7 +163,7 @@ def LSimple(x0, nnet, schedule,  loss_func=mos, panoptic=None,**kwargs):
         mask_gt = random.random() < p_uncond
         #Run the diffusion model to predict noises from image xn and panoptic segmentation mask mask_n 
         if use_panoptic and mask_gt: #input ground_truth, but use regular diffusion model architecture
-            eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=scaled_panoptic, use_ground_truth=False, enable_panoptic=use_panoptic) 
+            eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=mask_n, mask_0=scaled_panoptic, use_ground_truth=False, enable_panoptic=use_panoptic) 
         #NOTE: test use ground truth panoptic mask
         elif use_ground_truth==True:
             eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=scaled_panoptic, use_ground_truth=True, enable_panoptic=use_panoptic) 
@@ -204,8 +208,7 @@ def LSimple(x0, nnet, schedule,  loss_func=mos, panoptic=None,**kwargs):
             #rescale from [-1,1] to [0,1]
             '''
             mask_pred= (mask_pred+1.0)/2.0 
-            scaled_panoptic= (scaled_panoptic+1.0)/2.0
-            loss_mask =  loss_func(mask_pred, scaled_panoptic).mean()
+            loss_mask =  loss_func(mask_pred, panoptic).mean()
             '''
             #loss_mask =  loss_func(mask_pred, panoptic).mean()
         if use_twophases==True: #average losses of two phases
@@ -220,7 +223,9 @@ def train(config):
         torch.backends.cudnn.deterministic = False
 
     mp.set_start_method('spawn')
-    accelerator = accelerate.Accelerator()
+    init_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=8000))
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = accelerate.Accelerator(kwargs_handlers=[ddp_kwargs,init_kwargs])
     device = accelerator.device
     accelerate.utils.set_seed(config.seed, device_specific=True)
     logging.info(f'Process {accelerator.process_index} using device: {device}')
@@ -279,12 +284,11 @@ def train(config):
     else:
         train_state = utils.initialize_train_state(config, device)
 
-    nnet, nnet_ema, optimizer, train_dataset_loader, test_dataset_loader = accelerator.prepare(
-        train_state.nnet, train_state.nnet_ema, train_state.optimizer, train_dataset_loader, test_dataset_loader)
-    lr_scheduler = train_state.lr_scheduler
-    train_state.resume(config.ckpt_root)
-    
-    if config.pretrained is not None: #NOTE: load a pretrained model for image generation
+    #resume from checkpoint
+    resumed = train_state.resume(config.ckpt_root) 
+
+    nnet= train_state.nnet #bind
+    if config.pretrained is not None and resumed==False: #NOTE: load a pretrained model for image generation if no ckpt
         nnet.load_state_dict(torch.load(config.pretrained),strict=False)
         #copy pretrained weights to mask stream
         logging.info(f'Load pretrained weights to image/mask streams')
@@ -295,8 +299,8 @@ def train(config):
         for  p1, p2 in zip (nnet.out_blocks, nnet.out_blocks_mask):
             p2.load_state_dict(p1.state_dict(),strict=False)
         
-        #fix loaded weights of image stream
-        
+    #fix loaded weights of image stream
+    if config.pretrained is not None:
         nnet.patch_embed.requires_grad_(False)
         nnet.context_embed.requires_grad_(False)
         nnet.time_embed.requires_grad_(False)
@@ -313,6 +317,12 @@ def train(config):
         nnet.mid_block.requires_grad_(False)
         nnet.up_blocks.requires_grad_(False)
     '''
+    
+    nnet, nnet_ema, optimizer, train_dataset_loader, test_dataset_loader = accelerator.prepare(
+        nnet, train_state.nnet_ema, train_state.optimizer, train_dataset_loader, test_dataset_loader)
+    lr_scheduler = train_state.lr_scheduler
+    
+
     loss_cross_entropy= torch.nn.CrossEntropyLoss()
 
     if use_unet==True:
@@ -321,8 +331,8 @@ def train(config):
     else:
         autoencoder = libs.autoencoder.get_model(**config.autoencoder)
     autoencoder.to(device)
-
-    wandb.watch(nnet)
+    if accelerator.is_main_process:
+        wandb.watch(nnet)
 
     @ torch.cuda.amp.autocast()
     def encode(_batch):
@@ -363,13 +373,13 @@ def train(config):
     _schedule = Schedule(_betas)
     logging.info(f'use {_schedule}')
 
-    def cfg_nnet(x, timesteps, context, mask_token=None, use_ground_truth=False, enable_panoptic=False):
+    def cfg_nnet(x, timesteps, context, mask_token=None, mask_0=None,use_ground_truth=False, enable_panoptic=False):
 
         if use_panoptic==True:
             if use_unet==True:
                 _cond, pred_mask = nnet_ema(x, timesteps, encoder_hidden_states=context, mask_token=mask_token,use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic, return_dict=False)
             else:
-                _cond, pred_mask = nnet_ema(x, timesteps, context=context, mask_token=mask_token,use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
+                _cond, pred_mask = nnet_ema(x, timesteps, context=context, mask_token=mask_token, mask_0=mask_0,use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
         else:
             if use_unet==True:
                 _cond= nnet_ema(x, timesteps, encoder_hidden_states=context, mask_token=None,use_ground_truth=use_ground_truth, enable_panoptic=False, return_dict=False)
@@ -380,18 +390,18 @@ def train(config):
         _empty_context = einops.repeat(_empty_context, 'L D -> B L D', B=x.size(0))
         
         if config.sample.cfg==True:
-            '''
+            
             if enable_panoptic==True:
                 if use_unet==True:
                     _uncond, pred_mask_u = nnet_ema(x, timesteps, encoder_hidden_states=_empty_context, mask_token=mask_token,use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic, return_dict=False)
                 else:
-                    _uncond, pred_mask_u = nnet_ema(x, timesteps, context=_empty_context, mask_token=mask_token,use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
+                    _uncond, pred_mask_u = nnet_ema(x, timesteps, context=_empty_context, mask_token=mask_token,  mask_0=mask_0,use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic)
             else:
-            '''
-            if use_unet==True: #unconditioned, no context or masks
-                _uncond = nnet_ema(x, timesteps, encoder_hidden_states=_empty_context, return_dict=False)
-            else:
-                _uncond = nnet_ema(x, timesteps, context=_empty_context)
+            
+                if use_unet==True: #unconditioned, no context or masks
+                    _uncond = nnet_ema(x, timesteps, encoder_hidden_states=_empty_context, return_dict=False)
+                else:
+                    _uncond = nnet_ema(x, timesteps, context=_empty_context)
         
             #TODO: CFG for masks. Only context no masks
             '''
@@ -405,7 +415,7 @@ def train(config):
             '''
         
         if use_panoptic==True:
-            #pred_mask = pred_mask +config.sample.scale * (pred_mask -  pred_mask_u)
+            pred_mask = pred_mask +config.sample.scale * (pred_mask -  pred_mask_u)
             if config.sample.cfg==True:
                 return _cond + config.sample.scale * (_cond - _uncond), pred_mask
                 #return _cond + config.sample.scale * (_cond - 0.5*_uncond- 0.5*_uncond_mask), pred_mask
@@ -487,7 +497,8 @@ def train(config):
             if mask_token is None:
                 return cfg_nnet(x, t, **kwargs)
             else: #the arguments are enabled in dpm_solver_pp.py
-                return cfg_nnet(x, t, mask_token=mask_token, use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic, **kwargs)
+                #Note: this panoptic is pred_mask by dpm solver, not ground truth input
+                return cfg_nnet(x, t, mask_token=mask_token, mask_0=panoptic, use_ground_truth=use_ground_truth, enable_panoptic=enable_panoptic, **kwargs)
                 #TODO: try division in the backward process
                 #return panoptic * cfg_nnet(x, t, **kwargs)
                 #return torch.div( cfg_nnet(x, t, **kwargs), panoptic+1.0e-6)
@@ -511,11 +522,11 @@ def train(config):
                 _z = noise_scheduler.step(noise_pred, t, _z).prev_sample
         else:
             #TODO: try first order solver, set order=1
-            if solver_order==1:
-                _z, pred_mask = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=1, panoptic=panoptic, method='singlestep', mask_token=mask_token, use_twophases=use_twophases, enable_mask_opt= (use_panoptic and not use_ground_truth), use_ground_truth=use_ground_truth, enable_panoptic=use_panoptic)
+            if solver_order==1: #NOTE: input panoptic is not used, it is replaced with predicted mask in dpm solver
+                _z, pred_mask = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=1, panoptic=scaled_panoptic, method='singlestep', mask_token=mask_token, use_twophases=use_twophases, enable_mask_opt= (use_panoptic and not use_ground_truth), use_ground_truth=use_ground_truth, enable_panoptic=use_panoptic)
             else:#third order
                 if use_panoptic==True:
-                    _z, pred_mask = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=3, panoptic=panoptic, mask_token=mask_token, enable_mask_opt=(use_panoptic and not use_ground_truth), use_ground_truth=use_ground_truth, enable_panoptic=True)
+                    _z, pred_mask = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=3, panoptic=scaled_panoptic, mask_token=mask_token, enable_mask_opt=(use_panoptic and not use_ground_truth), use_ground_truth=use_ground_truth, enable_panoptic=True)
                 else:
                     _z, _ = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=3)
                 
@@ -727,12 +738,12 @@ def get_hparams():
             lst.append(f'{hparam}={val}')
     hparams = '-'.join(lst)
     if hparams == '':
-        from datetime import datetime
         date= datetime.now().strftime('%Y-%m-%d-%H-%M')
         #hparams = 'coco2017-1-analog-bits-mse'#+date
         #hparams ='coco2017-1-baseline'
         #hparams = 'coco2017-3-ground-truth-analogbit'
-        hparams = 'coco2017-3-mask4-finallayer'
+        hparams = 'coco2017-3-mask-tanh-noise2'
+        #hparams = 'multigpu-test'
         #hparams = 'coco2017-3-mask4-gt0.2'
         #hparams = 'coco2017-1-base-unet-pndm'
     return hparams
@@ -747,8 +758,7 @@ def main(argv):
     config.sample_dir = os.path.join(config.workdir, 'samples')
     config.train_sample_dir = os.path.join(config.workdir, 'train_samples')
     config.evaluation_only = FLAGS.evaluation_only
-    #config.pretrained = '/home/nano01/a/long273/results/mscoco_uvit_small/coco2017-3-cfg-mask/ckpts/300000.ckpt/nnet.pth'
-    config.pretrained = '/home/min/a/long273/Documents/diffusers/U-ViT/pretrained_model/mscoco_uvit_small.pth'
+    
     global use_unet
     use_unet=config.use_unet
     global autoencoder_scale

@@ -380,22 +380,23 @@ class TrainState(object):
 
     def resume(self, ckpt_root, step=None):
         if not os.path.exists(ckpt_root):
-            return
+            return False
         if step is None:
             ckpts = list(filter(lambda x: '.ckpt' in x, os.listdir(ckpt_root)))
             if not ckpts:
-                return
+                return False
             if not ckpts[0].split(".")[0].isnumeric():
                 ckpt_path = os.path.join(ckpt_root, f'best.ckpt')
                 logging.info(f'resume from {ckpt_path}')
                 self.load(ckpt_path)
-                return
+                return True
             else:
                 steps = map(lambda x: int(x.split(".")[0]), ckpts)
                 step = max(steps)
         ckpt_path = os.path.join(ckpt_root, f'{step}.ckpt')
         logging.info(f'resume from {ckpt_path}')
         self.load(ckpt_path)
+        return True
 
     def to(self, device):
         for key, val in self.__dict__.items():

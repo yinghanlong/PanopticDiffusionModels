@@ -335,12 +335,17 @@ class UViT(nn.Module): #TODO: set the flags!!!
         if enable_panoptic==True:
             #NOTE: use 2 times patch size for masks
             self.mask_embed=PatchEmbed(patch_size=patch_size, in_chans=num_panoptic_class, embed_dim=embed_dim) #map category id to embed dim
-            patch_dim_mask = patch_size ** 2 * num_panoptic_class
+            self.mask_embed_0=PatchEmbed(patch_size=patch_size, in_chans=num_panoptic_class, embed_dim=embed_dim) #map category id to embed dim
+            
+            #self.mask_embed=PatchEmbed(patch_size=patch_size, in_chans=num_panoptic_class, embed_dim=embed_dim) #map category id to embed dim
+            #NOTE: use 2 times patch size for masks
+            patch_dim_mask = (patch_size) ** 2 * num_panoptic_class
             self.decoder_pred_mask = nn.Linear(embed_dim, patch_dim_mask, bias=True)
         
             #NOTE: predict category ids and then use cross entropy loss #set num_panoptic_class to 8 for analog bits
             self.num_panoptic_class = num_panoptic_class
             self.final_layer_mask =nn.Conv2d(num_panoptic_class, num_panoptic_class,3, padding=1) if conv else nn.Identity()
+            self.final_act = nn.Tanh()
         #NOTE: set to true if input ground truth mask
         self.use_ground_truth=use_ground_truth
 
@@ -370,7 +375,7 @@ class UViT(nn.Module): #TODO: set the flags!!!
     def no_weight_decay(self):
         return {'pos_embed'}
 
-    def forward(self, x, timesteps, context, mask_token=None, use_ground_truth=False, enable_panoptic=False):
+    def forward(self, x, timesteps, context, mask_token=None, mask_0=None, use_ground_truth=False, enable_panoptic=False):
         #NOTE: activate/deactivate this when calling the forward pass of the model
         self.use_ground_truth=use_ground_truth
         
@@ -383,6 +388,12 @@ class UViT(nn.Module): #TODO: set the flags!!!
         #TODO: add mask token randomly initialized
         if mask_token is not None:
             mask_embedding=self.mask_embed(mask_token)
+            #NOTE: add mask_0 to mask embedding
+            '''
+            if mask_0 is not None:
+                mask_0_embed = self.mask_embed_0(mask_0)
+                mask_embedding= mask_embedding+ mask_0_embed
+            '''
             if self.separate==False:
                 x = torch.cat((time_token, context_token, x, mask_embedding), dim=1)
                 x = x + self.pos_embed
@@ -490,17 +501,16 @@ class UViT(nn.Module): #TODO: set the flags!!!
                     #NOTE:project mask to image, zero initialized
                     #mask2image = self.decoder_mask2image(x[:, self.extras+L:, :])
                     #noise= noise + mask2image
-
-                    y = unpatchify(y, self.num_panoptic_class)#self.in_chans)
-                    y = self.final_layer_mask(y)
                 else: 
                     noise = self.decoder_pred(x[:, self.extras:, :])
                     #NOTE: add extras to mask or share with x
                     y = self.decoder_pred_mask(m)
                     #y = self.decoder_pred_mask(m[:, self.extras:, :])
 
-                    y = unpatchify(y, self.num_panoptic_class)#self.in_chans)
-                    y = self.final_layer_mask(y)
+                y = unpatchify(y, self.num_panoptic_class)#self.in_chans)
+                y = self.final_layer_mask(y)
+                #NOTE: add non-linear activation layer
+                y = self.final_act(y)
 
 
         else:

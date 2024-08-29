@@ -1,10 +1,13 @@
-ssh long273@cbric-gpu15.ecn.purdue.edu
+ssh long273@cbric-gpu21.ecn.purdue.edu
 cd Documents
 source myenv/bin/activate
 cd diffusers/U-ViT
 source ~/.bashrc
 
-python -m clip_score /home/nano01/a/long273/results/mscoco_uvit_mid/coco2017-3-analogbit-mid/samples /home/nano01/a/long273/coco256_features/val2017 --device cuda:1
+find . -depth -name "*_text.txt" -exec sh -c 'f="{}"; mv -- "$f" "${f%_text.txt}.txt"' \;
+
+python -m clip_score /home/nano01/a/long273/results/mscoco_uvit_mid/coco2017-3-mid-patch2/samples /home/nano01/a/long273/coco256_features/val2017 --device cuda:3
+python -m clip_score /home/nano01/a/long273/results/mscoco_uvit_small/coco2017-3-mask4-tanh-noise2/samples /home/nano01/a/long273/coco256_features/val2017 --device cuda:3
 CUDA_VISIBLE_DEVICES=3
 # CIFAR10 (U-ViT-S/2)
 accelerate launch --multi_gpu --num_processes 4 --mixed_precision fp16 train.py --config=configs/cifar10_uvit_small.py

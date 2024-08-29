@@ -103,6 +103,7 @@ class DatasetFactory(object):
 
     def unpreprocess(self, v):  # to B C H W and [0, 1]
         v = 0.5 * (v + 1.)
+        v = v.float() #change to float 32 because float 16 clamp is not implemented for cpu
         v.clamp_(0., 1.)
         return v
 
@@ -586,9 +587,10 @@ class MSCOCOFeatureDataset(Dataset):
             #use scaled id
             #s = np.load(os.path.join(self.root, f'{index}_p.npy'))
             #pool masks from size (3,256,256) to (1,32,32) or 64,64
-            #s = skimage.measure.block_reduce(s, (3,4,4), np.min)
-            s = skimage.measure.block_reduce(s, (3,8,8), np.min)
-            #TODO: concat (1,64,64) to (4,32,32)
+            #s = skimage.measure.block_reduce(s, (3,2,2), np.min)
+            s = skimage.measure.block_reduce(s, (3,4,4), np.min)
+            #s = skimage.measure.block_reduce(s, (3,8,8), np.min)
+            #NOTE: concat (1,64,64) to (4,32,32)
             '''
             s_1 = s[:,::2,::2] 
             s_2 = s[:,1::2,::2] 
@@ -633,6 +635,7 @@ class MSCOCO256Features(DatasetFactory):  # the moments calculated by Stable Dif
 
         # text embedding extracted by clip
         # for visulization in t2i
+        # NOTE: visualize with imagenet
         self.prompts, self.contexts = [], []
         for f in sorted(os.listdir(os.path.join(path, 'run_vis')), key=lambda x: int(x.split('.')[0])):
             prompt, context = np.load(os.path.join(path, 'run_vis', f), allow_pickle=True)

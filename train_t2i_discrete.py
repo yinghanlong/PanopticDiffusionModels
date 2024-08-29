@@ -152,13 +152,13 @@ def LSimple(x0, nnet, schedule,  loss_func=mos, panoptic=None,**kwargs):
     else:
         #scale panoptic to [-1,1]
         #scaled_panoptic = (panoptic/ 100.0 - 1.0) #category id's range is 1-200
-        #TODO: analog bits for masks
+        #NOTE: analog bits for masks
         # Discrete masks to analog bits.
         scaled_panoptic= utils.int2bits(panoptic,out_dtype=torch.float)
         scaled_panoptic = (scaled_panoptic * 2.0 - 1.0) # * scale =1
         #NOTE: use another noise for panoptic segmentation mask
         n, eps, xn, eps_m, mask_n = schedule.sample(x0, scaled_panoptic, phaseone=True)  # n in {1, ..., 1000}
-        #TODO:CFG classifier-free guidance for mask conditions, use ground-truth mask with p=0.2
+        #TEST:CFG classifier-free guidance for mask conditions, use ground-truth mask with p=0.2
         #zero_mask = torch.zeros_like(mask_n, device=mask_n.device)
         mask_gt = random.random() < p_uncond
         #Run the diffusion model to predict noises from image xn and panoptic segmentation mask mask_n 
@@ -169,11 +169,15 @@ def LSimple(x0, nnet, schedule,  loss_func=mos, panoptic=None,**kwargs):
             eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=scaled_panoptic, use_ground_truth=True, enable_panoptic=use_panoptic) 
         else:
             eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=mask_n, use_ground_truth=False, enable_panoptic=use_panoptic) 
+            #TEST: test with zero image
+            #zero_image= torch.zeros_like(xn, device=xn.device)
+            #eps_pred, mask_pred = nnet(zero_image, n, **kwargs, mask_token=scaled_panoptic, use_ground_truth=False, enable_panoptic=use_panoptic) 
+            
+            #TEST: test with zero mask
+            #eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=zero_mask, use_ground_truth=False, enable_panoptic=use_panoptic) 
             #NOTE: test alternatively optimizing eps and mask
             #eps_pred_2, mask_pred_2 = nnet(xn, n, **kwargs, mask_token=mask_pred, use_ground_truth=False, enable_panoptic=use_panoptic) 
-
-            #TODO: test with zero mask
-            #eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=zero_mask, use_ground_truth=False, enable_panoptic=use_panoptic) 
+            
             ##use initial noises as mask queries
             ##eps_pred, mask_pred = nnet(xn, n, **kwargs, mask_token=eps_m) 
         if use_twophases==True: #TODO:phase two use ground truth panoptic mask 
@@ -198,11 +202,14 @@ def LSimple(x0, nnet, schedule,  loss_func=mos, panoptic=None,**kwargs):
         if use_ground_truth==True:# or (use_panoptic and mask_gt):
             loss_mask= loss_eps
         else:
-            #TODO: Use mse loss for eps mask to predict noise
+            #TEST: Use mse loss for eps mask to predict noise
             #loss_mask= mos(mask_pred-eps_m)
 
             #Use mse loss for analog bits
             loss_mask= mos(mask_pred-scaled_panoptic)
+
+            #NOTE: test only optimize loss mask when zero image
+            #loss_eps = loss_mask
 
             #NOTE:use cross entropy loss for analog bits (8bits, target size=output size)
             #rescale from [-1,1] to [0,1]
@@ -239,7 +246,9 @@ def train(config):
     if accelerator.is_main_process:
         os.makedirs(config.ckpt_root, exist_ok=True)
         os.makedirs(config.sample_dir, exist_ok=True)
-        os.makedirs(config.train_sample_dir, exist_ok=True)
+        os.makedirs(config.train_sample_dir, exist_ok=True)           
+        mask_path=os.path.join(config.workdir, 'mask')
+        os.makedirs(mask_path, exist_ok=True)
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         wandb.init(dir=os.path.abspath(config.workdir), project=f'uvit_{config.dataset.name}', config=config.to_dict(),
@@ -292,14 +301,15 @@ def train(config):
         nnet.load_state_dict(torch.load(config.pretrained),strict=False)
         #copy pretrained weights to mask stream
         logging.info(f'Load pretrained weights to image/mask streams')
-        
+        '''
         for  p1, p2 in zip (nnet.in_blocks, nnet.in_blocks_mask):
             p2.load_state_dict(p1.state_dict(),strict=False)
         nnet.mid_block_mask.load_state_dict(nnet.mid_block.state_dict(),strict=False)
         for  p1, p2 in zip (nnet.out_blocks, nnet.out_blocks_mask):
             p2.load_state_dict(p1.state_dict(),strict=False)
-        
+        '''
     #fix loaded weights of image stream
+    
     if config.pretrained is not None:
         nnet.patch_embed.requires_grad_(False)
         nnet.context_embed.requires_grad_(False)
@@ -307,6 +317,7 @@ def train(config):
         nnet.in_blocks.requires_grad_(False)
         nnet.mid_block.requires_grad_(False)
         nnet.out_blocks.requires_grad_(False)
+    
     #fix pretrained weights
     '''
     if config.use_unet==True:
@@ -454,11 +465,12 @@ def train(config):
             _metrics['loss_mask'] = accelerator.gather(loss_mask.detach()).mean()
         #TODO: backpropagate the sum of losses
         #TODO: Jan17 test use ground truth mask
+        loss_eps = accelerator.gather(loss_eps).mean()
         if use_ground_truth==True or use_panoptic==False:
-            loss_sum = loss_eps 
+            loss_sum = loss_eps
         else:
-            loss_sum = loss_eps  + loss_mask
-        accelerator.backward(loss_sum.mean())
+            loss_sum = loss_eps  + accelerator.gather(loss_mask).mean()
+        accelerator.backward(loss_sum)
         optimizer.step()
         lr_scheduler.step()
         train_state.ema_update(config.get('ema_rate', 0.9999))
@@ -523,7 +535,10 @@ def train(config):
         else:
             #TODO: try first order solver, set order=1
             if solver_order==1: #NOTE: input panoptic is not used, it is replaced with predicted mask in dpm solver
-                _z, pred_mask = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=1, panoptic=scaled_panoptic, method='singlestep', mask_token=mask_token, use_twophases=use_twophases, enable_mask_opt= (use_panoptic and not use_ground_truth), use_ground_truth=use_ground_truth, enable_panoptic=use_panoptic)
+                if use_panoptic==True:
+                    _z, pred_mask = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=1, panoptic=scaled_panoptic, method='singlestep', mask_token=mask_token, use_twophases=use_twophases, enable_mask_opt= (use_panoptic and not use_ground_truth), use_ground_truth=use_ground_truth, enable_panoptic=use_panoptic)
+                else: 
+                    _z, _ = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=1, method='singlestep')
             else:#third order
                 if use_panoptic==True:
                     _z, pred_mask = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=3, panoptic=scaled_panoptic, mask_token=mask_token, enable_mask_opt=(use_panoptic and not use_ground_truth), use_ground_truth=use_ground_truth, enable_panoptic=True)
@@ -531,7 +546,7 @@ def train(config):
                     _z, _ = dpm_solver.sample(_z_init, steps=_sample_steps, eps=1. / _schedule.N, T=1., order=3)
                 
         #TODO: show predicted mask, evaluate the loss with panoptic
-        if panoptic is not None:
+        if use_panoptic==True:
             
             if use_ground_truth==True:
                 loss_mean=1.0
@@ -562,28 +577,31 @@ def train(config):
         def sample_fn(_n_samples, use_panoptic=False, print_text=False):
             _context = next(context_generator)
             index= _context[2]
-            if print_text==True:
-                
+            '''
+            #Print captions
+            if print_text==True:                
                 caption_text=""
                 for i in range(index.size(0)):
                     file = open(os.path.join(config.dataset.path, f'val2017/{index[i]}_text.txt'), "r")
                     caption_text+=' '+ str(i)+ file.readline()
                 with open(os.path.join(config.workdir, 'caption.log'), 'a') as f:
-                    print(caption_text, file=f)
+                    f.write(caption_text+'\n')#print(,caption_text, file=f)
+            '''
             assert _context[0].size(0) == _n_samples
             if use_panoptic==True:
                 samples, pred_mask, loss_mask, panoptic= dpm_solver_sample(_n_samples, sample_steps, panoptic=_context[1], loss_func=loss_cross_entropy, context=_context[0]) #context: conditions
                 return index, samples, pred_mask, loss_mask, panoptic
             else:
-                return dpm_solver_sample(_n_samples, sample_steps, panoptic=None,context=_context[0]) #context: conditions
+                samples = dpm_solver_sample(_n_samples, sample_steps, panoptic=None,context=_context[0]) 
+                return index, samples #context: conditions
             
         with tempfile.TemporaryDirectory() as temp_path:
             #path = config.sample.path or temp_path
             #Save to the working dir of the current model
             path = config.sample_dir
-            if accelerator.is_main_process:
-                os.makedirs(path, exist_ok=True)
-                mask_path=os.path.join(config.workdir, 'mask')
+            mask_path=os.path.join(config.workdir, 'mask')
+            #if accelerator.is_main_process:
+            #    os.makedirs(path, exist_ok=True)
 
             utils.sample2dir(accelerator, path, n_samples, config.sample.mini_batch_size, sample_fn, dataset.unpreprocess, step=train_state.step, use_panoptic=use_panoptic, use_ground_truth=use_ground_truth, mask_path=mask_path, mask_channel=config.mask_channel)
 
@@ -604,40 +622,46 @@ def train(config):
 
     step_fid = []
     while train_state.step <= config.train.n_steps or config.evaluation_only:
-        #TODO: set evaluation only
-        #if config.evaluation_only is None:
-        nnet.train()
-        batch = tree_map(lambda x: x.to(device), next(data_generator))
-        metrics = train_step(batch)
+        #TODO: only train if not evaluation only
+        if config.evaluation_only==False:
+            nnet.train()
+            batch = tree_map(lambda x: x.to(device), next(data_generator))
+            metrics = train_step(batch)
+
+            if accelerator.is_main_process and train_state.step % config.train.log_interval == 0:
+                logging.info(utils.dct2str(dict(step=train_state.step, **metrics)))
+                logging.info(config.workdir)
+                wandb.log(metrics, step=train_state.step)
 
         nnet.eval()
-        if accelerator.is_main_process and train_state.step % config.train.log_interval == 0:
-            logging.info(utils.dct2str(dict(step=train_state.step, **metrics)))
-            logging.info(config.workdir)
-            wandb.log(metrics, step=train_state.step)
-
         if accelerator.is_main_process and (train_state.step % config.train.eval_interval == 0 or config.evaluation_only):
             torch.cuda.empty_cache()
             logging.info('Save a grid of images...')
-            bs= min(config.sample.mini_batch_size,10)
+            bs= min(config.sample.mini_batch_size,30)
+            #NOTE: use specific context for evaluation visualization
             contexts = torch.tensor(dataset.contexts, device=device)[: bs]
-            #TODO: pick the first batch for evaluation
+            #NOTE: pick the first batch for evaluation
+            
             for data in test_dataset_loader:
                 contexts = data[1:]
             index= contexts[2][: bs]
             caption_text=""
             for i in range(index.size(0)):
-                file = open(os.path.join(config.dataset.path, f'val2017/{index[i]}_text.txt'), "r")
+                file = open(os.path.join(config.dataset.path, f'val2017/{index[i]}.txt'), "r")
                 caption_text+=' '+ str(i)+ file.readline()
             with open(os.path.join(config.workdir, 'eval_caption.log'), 'a') as f:
                 print(caption_text, file=f)
+            
             if use_panoptic==True:
                 
-                panoptic_rand = torch.zeros(bs,1,32,32, dtype=torch.long, device=device)
+                panoptic_rand = torch.zeros(bs,1,64,64, dtype=torch.long, device=device)
                 #TODO: check context size?
                 #print('check shapes',contexts[0].shape, contexts[1].shape) #[b,7,768]
                 samples, pred_mask, _, _ = dpm_solver_sample(_n_samples=bs, _sample_steps=50, panoptic=contexts[1][: bs,:,:,:], loss_func=loss_cross_entropy, context=contexts[0][: bs,:,:])
-                mask_max, mask_label = torch.max(pred_mask,dim=1, keepdim=True) #indices=class labels, [b,1,h,w]
+                #NOTE: use specific contexts
+                #samples, pred_mask, _, _ = dpm_solver_sample(_n_samples=bs, _sample_steps=50, panoptic=panoptic_rand, loss_func=loss_cross_entropy, context=contexts[: bs,:,:])
+                
+                #mask_max, mask_label = torch.max(pred_mask,dim=1, keepdim=True) #indices=class labels, [b,1,h,w]
                 #color_mask = torch.zeros_like(pred_mask)
                 #logging.info('Change category ids of masks to colors')
                 #for i in range(mask_label.shape[0]):
@@ -659,18 +683,18 @@ def train(config):
                 wandb.log({'samples pred_mask': wandb.Image(grid_mask)}, step=train_state.step)
             else:
                 samples= dpm_solver_sample(_n_samples=bs, _sample_steps=50, panoptic=None, context=contexts[0][: bs,:,:])
-            accelerator.wait_for_everyone()
-            samples = make_grid(dataset.unpreprocess(samples), 5)
+            #accelerator.wait_for_everyone()
+            samples = make_grid(dataset.unpreprocess(samples.cpu()), 5)
             save_image(samples, os.path.join(config.train_sample_dir, f'{train_state.step}.png'))
             wandb.log({'samples': wandb.Image(samples)}, step=train_state.step)
             
             torch.cuda.empty_cache()
-        accelerator.wait_for_everyone()
+        #accelerator.wait_for_everyone()
 
         if config.evaluation_only or train_state.step % config.train.save_interval == 0 or train_state.step == config.train.n_steps:
-            torch.cuda.empty_cache()
-            accelerator.wait_for_everyone()
-            fid = eval_step(n_samples=10000, sample_steps=50)  # calculate fid of the saved checkpoint
+            #torch.cuda.empty_cache()
+            #accelerator.wait_for_everyone()
+            fid = eval_step(n_samples=config.sample.n_samples, sample_steps=50)  # calculate fid of the saved checkpoint
             logging.info(f'Save and eval checkpoint {train_state.step}...')
             if accelerator.local_process_index == 0:
                 if len(step_fid)==0:
@@ -685,8 +709,8 @@ def train(config):
             
             step_fid.append((train_state.step, fid))
             torch.cuda.empty_cache()
-        accelerator.wait_for_everyone()
-        if config.evaluation_only:
+        #accelerator.wait_for_everyone()
+        if config.evaluation_only==True:
             break
 
     logging.info(f'Finish fitting, step={train_state.step}')
@@ -696,8 +720,9 @@ def train(config):
         logging.info(f'step_fid: {step_fid}')
         step_best = sorted(step_fid, key=lambda x: x[1])[0][0]
         logging.info(f'step_best: {step_best}')
+        del metrics
     train_state.load(os.path.join(config.ckpt_root, f'{step_best}.ckpt'))
-    del metrics
+    
     accelerator.wait_for_everyone()
     eval_step(n_samples=config.sample.n_samples, sample_steps=config.sample.sample_steps)
 
@@ -741,10 +766,14 @@ def get_hparams():
         date= datetime.now().strftime('%Y-%m-%d-%H-%M')
         #hparams = 'coco2017-1-analog-bits-mse'#+date
         #hparams ='coco2017-1-baseline'
+        #hparams ='coco2017-3-baseline-mid'
         #hparams = 'coco2017-3-ground-truth-analogbit'
-        hparams = 'coco2017-3-mask-tanh-noise2'
+        #hparams = 'coco2017-3-patch4-noise2'
+        #hparams = 'coco2017-3-truemask4-patch'
+        #hparams = 'coco2017-3-patch2-zeroimage-onestream'
+        #hparams = 'coco2017-3-mid-patch2'
         #hparams = 'multigpu-test'
-        #hparams = 'coco2017-3-mask4-gt0.2'
+        hparams = 'coco2017-3-mask4-tanh-noise2'
         #hparams = 'coco2017-1-base-unet-pndm'
     return hparams
 

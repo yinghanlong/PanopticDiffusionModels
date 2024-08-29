@@ -36,8 +36,8 @@ def interpolate_fn(x: torch.Tensor, xp: torch.Tensor, yp: torch.Tensor) -> torch
         ),
     )
     end_idx = torch.where(torch.eq(start_idx, cand_start_idx), start_idx + 2, start_idx + 1)
-    start_x = torch.gather(sorted_x_breakpoints, dim=2, index=start_idx.unsqueeze(2)).squeeze(2)
-    end_x = torch.gather(sorted_x_breakpoints, dim=2, index=end_idx.unsqueeze(2)).squeeze(2)
+    start_x = torch.gather(sorted_x_breakpoints, dim=2, index=start_idx.unsqueeze(2)).squeeze(2).to(x.device)
+    end_x = torch.gather(sorted_x_breakpoints, dim=2, index=end_idx.unsqueeze(2)).squeeze(2).to(x.device)
     start_idx2 = torch.where(
         torch.eq(x_idx, 0),
         torch.tensor(0, device=x.device),
@@ -46,8 +46,8 @@ def interpolate_fn(x: torch.Tensor, xp: torch.Tensor, yp: torch.Tensor) -> torch
         ),
     )
     y_positions_expanded = yp.unsqueeze(0).expand(x.shape[0], -1, -1)
-    start_y = torch.gather(y_positions_expanded, dim=2, index=start_idx2.unsqueeze(2)).squeeze(2)
-    end_y = torch.gather(y_positions_expanded, dim=2, index=(start_idx2 + 1).unsqueeze(2)).squeeze(2)
+    start_y = torch.gather(y_positions_expanded, dim=2, index=start_idx2.unsqueeze(2)).squeeze(2).to(x.device)
+    end_y = torch.gather(y_positions_expanded, dim=2, index=(start_idx2 + 1).unsqueeze(2)).squeeze(2).to(x.device)
     cand = start_y + (x - start_x) * (end_y - start_y) / (end_x - start_x)
     return cand
 
@@ -1020,8 +1020,12 @@ class DPM_Solver:
             timesteps = self.get_time_steps(skip_type=skip_type, t_T=t_T, t_0=t_0, N=steps, device=device)
             with torch.no_grad():
                 i = 0
-                pred_mask = mask_token
-                mask_t=mask_token
+                if mask_token is not None:
+                    pred_mask = mask_token.to(x.device)
+                    mask_t=mask_token.to(x.device)
+                else:
+                    pred_mask = mask_token
+                    mask_t = mask_token
                 #if mask_t is None:
                 #    print("*****ERROR: mask token is none at beginning")
                 for order in orders:
@@ -1044,8 +1048,12 @@ class DPM_Solver:
             timesteps = self.get_time_steps(skip_type=skip_type, t_T=t_T, t_0=t_0, N=N_steps, device=device)
             assert len(timesteps) - 1 == N_steps
             #NOTE:iteratively generate the mask by steps
-            mask_t = mask_token
-            pred_mask = mask_token
+            if mask_token is not None:
+                mask_t = mask_token.to(x.device)
+                pred_mask = mask_token.to(x.device)
+            else:
+                mask_t = mask_token
+                pred_mask = mask_token
             with torch.no_grad():
                 for i, order in enumerate(orders):
                     vec_s, vec_t = torch.ones((x.shape[0],)).to(device) * timesteps[i], torch.ones((x.shape[0],)).to(device) * timesteps[i + 1]

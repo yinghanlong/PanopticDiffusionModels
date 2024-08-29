@@ -19,8 +19,8 @@ def get_config():
     )
 
     config.train = d(
-        n_steps=1000000,#1000000
-        batch_size= 128, #128,#256
+        n_steps=2000000,#1000000
+        batch_size= 64, #128,#256
         log_interval=20,
         eval_interval=5000,
         save_interval=50000,
@@ -51,7 +51,7 @@ def get_config():
         mlp_time_embed=False,
         clip_dim=768,
         num_clip_token=77,
-        enable_panoptic=True, use_ground_truth=False, separate=True, num_panoptic_class=8 #8 or 32
+        enable_panoptic=True, use_ground_truth=False, separate=True, num_panoptic_class=8, patch_factor=2 #1,2,4
     )
 
     config.dataset = d(
@@ -63,8 +63,8 @@ def get_config():
 
     config.sample = d(
         sample_steps=50,
-        n_samples=30000,
-        mini_batch_size= 64,#32
+        n_samples=10000,
+        mini_batch_size= 32,
         cfg=True,
         scale=1.,
         path='/home/nano01/a/long273/results/sample'
@@ -72,6 +72,6 @@ def get_config():
     #config.use_twophases=True
     config.use_unet=False
     config.mask_channel=1 #1 by default
-    config.pretrained = '/home/nano01/a/long273/results/mscoco_uvit_small/coco2017-3-mask-tanh/ckpts/100000.ckpt/nnet.pth'
-    #config.pretrained = '/home/min/a/long273/Documents/diffusers/U-ViT/pretrained_model/mscoco_uvit_small.pth'
+    #config.pretrained = '/home/nano01/a/long273/results/mscoco_uvit_small/coco2017-1-baseline/ckpts/1000000.ckpt/nnet.pth'
+    config.pretrained = '/home/min/a/long273/Documents/diffusers/U-ViT/pretrained_model/mscoco_uvit_small.pth'
     return config

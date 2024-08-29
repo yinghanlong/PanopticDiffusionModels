@@ -375,8 +375,14 @@ class TrainState(object):
         logging.info(f'load from {path}')
         self.step = torch.load(os.path.join(path, 'step.pth'))
         for key, val in self.__dict__.items():
+            #if key=='optimizer':
+            #    continue
+            #print(key)
             if key != 'step' and val is not None:
-                val.load_state_dict(torch.load(os.path.join(path, f'{key}.pth'), map_location='cpu'))
+                if 'nnet' in key:
+                    val.load_state_dict(torch.load(os.path.join(path, f'{key}.pth'), map_location='cpu'),strict=False)
+                else:
+                    val.load_state_dict(torch.load(os.path.join(path, f'{key}.pth'), map_location='cpu'))
 
     def resume(self, ckpt_root, step=None):
         if not os.path.exists(ckpt_root):
@@ -479,12 +485,20 @@ def int2bits(x, n=8, out_dtype=None):
   #print('mod by 2:',y.shape, y[0,:,0,0])
   if out_dtype and out_dtype != y.dtype:
     y = y.type(out_dtype)
-  return y
+  return y.to(x.device)
 
 def bits2int(x, out_dtype=torch.int, n=8, c=1):
   """Converts bits x in (b,n,h,w) into an integer in (b,1,h,w)."""
   """Converts bits x in (b,n*c,h,w) into an integer in (b,c,h,w). Then reshape to (b,1,h*sqrt(c),w*sqrt(c))"""
   # c: num of patch channels, usually=1 or 4
+  x = x.type(out_dtype)
+  
+  y = torch.zeros(x.shape[0],1, x.shape[2],x.shape[3],device=x.device)
+  
+  for i in range(n):
+    y[:,0,:,:] += x[:,i,:,:] * (2 ** (n-1-i))
+    
+  '''
   x = x.type(out_dtype)
   sc = int(math.sqrt(c))
   y = torch.zeros(x.shape[0],1, x.shape[2]*sc,x.shape[3]*sc,device=x.device)
@@ -494,14 +508,14 @@ def bits2int(x, out_dtype=torch.int, n=8, c=1):
     #print(x.shape, p.shape)
     for i in range(n):
         #print(p.shape, x[:,i*c+j,:,:].shape)
-        p[:,0,:,:] += x[:,i*c+j,:,:] * (2 ** i)
+        p[:,0,:,:] += x[:,i*c+j,:,:] * (2 ** (n-1-i))
     if c>1:
         y[:,:,offset[j][1]::sc,offset[j][0]::sc]= p 
     else:
         y=p
- 
+  '''
   #x = torch.sum(x * (2 ** torch.range(start=0,end=x.shape[1])), 1, keepdim=True)
-  return y #.unsqueeze(1)
+  return y.cpu() #.unsqueeze(1)
 
 #NOTE: object ID = R * 256 * G + 256 * 256 + B. But
 def get_colormap(path, force=False):
@@ -513,7 +527,7 @@ def get_colormap(path, force=False):
         # save
         print('---SAVE COLORMAP---')
         torch.save(colormap, path)                 
-    return colormap.cuda()
+    return colormap#.cuda()
     
 
 def color_map(x):
@@ -528,20 +542,22 @@ def color_map(x):
     #print(x.shape)
     return x
 
-def mse(a):  # mean of square
+def mae(a):  # mean of absolute value
     b=a.clone().float()
-    return b.pow(2).mean(dim=-1)
+    return b.abs().mean(dim=-1)
 def eval_mask_cnt(pred_mask, panoptic):#compare the number of category pixels in generated mask and original ones
     batch= pred_mask.shape[0]
-    pd= pred_mask.flatten(start_dim=1)
-    gt= panoptic.flatten(start_dim=1)
+    pd= pred_mask.flatten(start_dim=1).cpu()
+    gt= panoptic.flatten(start_dim=1).cpu()
     cnt_diff=0.
+    pixel_num= gt.shape[1]
     for i in range(batch):
         pred_cnt = torch.bincount(pd[i,:].int(), minlength=201)
         gt_cnt = torch.bincount(gt[i,:].int(), minlength=201)
-        cnt_diff+= mse(pred_cnt[:201]- gt_cnt[:201])
+        cnt_diff+= sum((pred_cnt[:201]- gt_cnt[:201]).abs())
+        #cnt_diff+= mae(pred_cnt[:201]- gt_cnt[:201])
 
-    return cnt_diff/batch
+    return cnt_diff/pixel_num/batch
 def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unpreprocess_fn=None, step=None, use_panoptic=False, use_ground_truth=False, mask_path=None,mask_channel=1):
     os.makedirs(path, exist_ok=True)
     idx = 0
@@ -562,14 +578,15 @@ def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unprepr
         else:
             print_text=False
         if use_panoptic==False:
-            samples = sample_fn(mini_batch_size, use_panoptic=False, print_text=print_text)
+            sample_idx, samples = sample_fn(mini_batch_size, use_panoptic=False, print_text=print_text)
         else:
             sample_idx, samples, pred_mask, loss_mask, panoptic = sample_fn(mini_batch_size,use_panoptic=True, print_text=print_text)
             #TODO:accumulate loss
-            loss_mask_all.append(loss_mask)
+            loss_mask_all.append(accelerator.gather(loss_mask))
             pred_mask = accelerator.gather(pred_mask.contiguous())[:_batch_size]
         samples = unpreprocess_fn(samples)
         samples = accelerator.gather(samples.contiguous())[:_batch_size]
+        samples = samples.detach().cpu() #send to cpu
         if accelerator.is_main_process:
             if idx==0 and (step is not None):
                 grid_samples = make_grid(samples, 8)
@@ -604,17 +621,19 @@ def sample2dir(accelerator, path, n_samples, mini_batch_size, sample_fn, unprepr
                 #grid_mask = make_grid(mask_label.float(), 8, normalize=True)
                 wandb.log({'pred_mask': wandb.Image(grid_mask)}, step)
 
-                color_panoptic= color_map(panoptic[:,0,:,:])
+                color_panoptic= color_map(panoptic[:,0,:,:].cpu())
                 ground_mask = make_grid(color_panoptic.float(), 8)
                 wandb.log({'ground_truth_mask': wandb.Image(ground_mask)}, step)
             for i,sample in enumerate(samples):
                 #img = Image.fromarray(color_masks[i,:,:,:], 'RGB')
                 #img.save(os.path.join(mask_path, f"{sample_idx[i]}.png"))
                 if use_panoptic==True:
-                    save_image(sample, os.path.join(path, f"{sample_idx[i]}.png"))
-                    #save_image(color_masks, os.path.join(mask_path, f"{idx}.png"))
+                    save_image(sample.cpu(), os.path.join(path, f"{sample_idx[i]+ 10000*(idx//4992)}.png"))
+                    ndarr= color_masks[i,:,:,:].permute(1, 2, 0).to("cpu", torch.uint8).numpy()
+                    im = Image.fromarray(ndarr)
+                    im.save(os.path.join(mask_path, f"{sample_idx[i]+ 10000*(idx//4992)}.png"))
                 else:
-                    save_image(sample, os.path.join(path, f"{idx}.png"))
+                    save_image(sample.cpu(), os.path.join(path, f"{sample_idx[i]+ 10000*(idx//4992)}.png"))
                 idx += 1
     if use_panoptic==True and (step is not None) and use_ground_truth==False:
         wandb.log({f'eval_loss_mask': torch.mean(torch.stack(loss_mask_all))}, step)
